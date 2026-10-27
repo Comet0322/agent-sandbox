@@ -1,0 +1,220 @@
+# Copyright 2026 The Kubernetes Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import logging
+from .trace_manager import create_tracer_manager
+from .commands.command_executor import CommandExecutor
+from .files.filesystem import Filesystem
+from .models import (
+    SandboxConnectionConfig,
+    SandboxLocalTunnelConnectionConfig,
+    SandboxTracerConfig,
+)
+from .k8s_helper import K8sHelper
+from .connector import SandboxConnector
+from .constants import POD_NAME_ANNOTATION
+from .utils import select_pod_ip, extract_sandbox_name_hash
+
+logger = logging.getLogger(__name__)
+
+
+class Sandbox:
+    """
+    Represents a connection to a specific running Sandbox instance.
+
+    This class provides the interface for interacting with the Sandbox, including:
+    - Executing commands via the `commands` property.
+    - Managing files via the `files` property.
+    - Handling the underlying connection.
+    - Integrating with OpenTelemetry for tracing operations.
+    """
+    def __init__(
+        self,
+        claim_name: str,
+        sandbox_id: str,
+        namespace: str = "default",
+        connection_config: SandboxConnectionConfig | None = None,
+        tracer_config: SandboxTracerConfig | None = None,
+        k8s_helper: K8sHelper | None = None,
+    ) -> None:
+        # Sandbox Related Configuration
+        self.claim_name: str | None = claim_name
+        self.sandbox_id = sandbox_id
+        self.namespace = namespace
+        self.connection_config = connection_config or SandboxLocalTunnelConnectionConfig()
+
+        # Sandbox Management downstream dependency
+        self.k8s_helper = k8s_helper or K8sHelper()
+
+        self.connector = SandboxConnector(
+            sandbox_id=self.sandbox_id,
+            namespace=self.namespace,
+            connection_config=self.connection_config,
+            k8s_helper=self.k8s_helper,
+            get_pod_ip=self.get_pod_ip,
+            get_pod_name=self.get_pod_name,
+            get_service_fqdn=self.get_service_fqdn,
+        )
+
+        # Tracer initialization
+        self.tracer_config = tracer_config or SandboxTracerConfig()
+        self.trace_service_name = self.tracer_config.trace_service_name
+        self.tracing_manager, self.tracer = create_tracer_manager(self.tracer_config)
+
+        # Initialisation of namespaced engines
+        self._commands: CommandExecutor | None = CommandExecutor(self.connector, self.tracer, self.trace_service_name)
+        self._files: Filesystem | None = Filesystem(self.connector, self.tracer, self.trace_service_name)
+        
+        # Internal state tracking
+        self._is_closed = False
+        self._pod_name: str | None = None
+        self._sandbox_name_hash: str | None = None
+        
+    def get_pod_name(self) -> str:
+        """Fetches the Sandbox object from Kubernetes and retrieves its current pod name."""
+        if self._pod_name is not None:
+            return self._pod_name
+
+        sandbox_object = self.k8s_helper.get_sandbox(self.sandbox_id, self.namespace) or {}
+        metadata = sandbox_object.get('metadata') or {}
+        annotations = metadata.get('annotations') or {}
+        pod_name = annotations.get(POD_NAME_ANNOTATION)
+        self._pod_name = pod_name if pod_name else self.sandbox_id
+        return self._pod_name
+
+
+    def get_sandbox_name_hash(self) -> str | None:
+        """Fetches the Sandbox object from Kubernetes and retrieves its name hash from selector.
+        Caches the result to avoid repeated API calls.
+        """
+        # Return cached value if available
+        if self._sandbox_name_hash is not None:
+            return self._sandbox_name_hash
+
+        sandbox_object = self.k8s_helper.get_sandbox(self.sandbox_id, self.namespace) or {}
+        sandbox_name_hash = extract_sandbox_name_hash(sandbox_object)
+        if sandbox_name_hash:
+            self._sandbox_name_hash = sandbox_name_hash
+
+        return sandbox_name_hash
+
+    def get_pod_ip(self) -> str | None:
+        """Selects a pod IP from the Sandbox status (prefers IPv4, normalizes canonical form).
+
+        Always queries the K8s API for the latest IP — the pod IP can change
+        after a pod restart (e.g. when spec.operatingMode is set to Suspended and resumed
+        via setting spec.operatingMode to Running).
+        Returns None if no valid IP can be selected.
+        """
+        sandbox_object = self.k8s_helper.get_sandbox(self.sandbox_id, self.namespace) or {}
+        status_data = sandbox_object.get("status") or {}
+        pod_ips = status_data.get('podIPs', [])
+        return select_pod_ip(pod_ips)
+
+    def get_service_fqdn(self) -> str | None:
+        """Return the controller-reported Service FQDN, when available."""
+        sandbox_object = self.k8s_helper.get_sandbox(self.sandbox_id, self.namespace) or {}
+        status_data = sandbox_object.get("status") or {}
+        fqdn = status_data.get("serviceFQDN")
+        return fqdn if isinstance(fqdn, str) and fqdn else None
+
+    def status(self) -> tuple[str, str]:
+        """
+        Retrieves the current status of the Sandbox by inspecting its Kubernetes conditions.
+        
+        Returns a tuple of (status, message).
+        status can be 'SandboxReady', 'SandboxNotFound', or 'SandboxNotReady'.
+        message contains the Kubernetes condition message if available.
+        """
+        sandbox_object = self.k8s_helper.get_sandbox(self.sandbox_id, self.namespace)
+        if not sandbox_object:
+            return "SandboxNotFound", "Sandbox object not found in Kubernetes."
+
+        status_data = sandbox_object.get("status") or {}
+        for cond in status_data.get("conditions") or []:
+            if cond.get("type") == "Ready":
+                message = cond.get("message", "")
+                if cond.get("status") == "True":
+                    return "SandboxReady", message
+                else:
+                    return "SandboxNotReady", message
+
+        return "SandboxNotReady", "Unknown message"
+
+    @property
+    def commands(self) -> CommandExecutor | None:
+        return self._commands
+
+    @property
+    def files(self) -> Filesystem | None:
+        return self._files
+
+    @property
+    def is_active(self) -> bool:
+        """
+        Returns True if the connection hasn't been explicitly closed 
+        and engines are still initialized.
+        """
+        return not self._is_closed and self._commands is not None and self._files is not None
+
+    def close_connection(self) -> None:
+        """
+        Closes the client-side connection and disables execution engines locally,
+        but leaves the remote Kubernetes Sandbox infrastructure running.
+        
+        Use this to free up local resources (like port-forwards or HTTP sessions).
+        """
+        if self._is_closed:
+            return
+        # Invalidate the cached pod name: a suspend/resume can bind this
+        # sandbox to a differently-named pod, and a stale name would make the
+        # next reconnect port-forward to a pod that no longer exists.
+        self._pod_name = None
+        # Close client side connection
+        self.connector.close()
+        
+        # Don't allow anymore further executions.
+        self._commands = None
+        self._files = None
+        
+        # Cleanup Trace if it exists
+        if self.tracing_manager:
+            try:
+                self.tracing_manager.end_lifecycle_span()
+            except Exception as e:
+                logger.error(f"Failed to end tracing span: {e}")
+        
+        self._is_closed = True
+        logger.info(f"Connection to sandbox claim '{self.claim_name}' has been closed.")
+    
+    def terminate(self) -> None:
+        """
+        Permanent deletion of all server side infrastructure and client side connection.
+
+        This method is idempotent. After a successful delete, ``claim_name`` is
+        cleared so later calls are a local no-op and do not issue another DELETE.
+        If the claim is already gone remotely, ``delete_sandbox_claim`` treats a
+        404 as success rather than raising.
+        """
+        # Close the client side connection and trace manager lifecycle
+        self.close_connection()
+
+        if not self.claim_name:
+            # Already deleted (or never successfully created a claim).
+            return
+
+        self.k8s_helper.delete_sandbox_claim(self.claim_name, self.namespace)
+
+        # Clear only after success so a failed delete can be retried.
+        self.claim_name = None

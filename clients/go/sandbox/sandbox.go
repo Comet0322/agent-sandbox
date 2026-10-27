@@ -1,0 +1,813 @@
+// Copyright 2026 The Kubernetes Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package sandbox
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"maps"
+	"net/http"
+	"sync"
+	"time"
+
+	"github.com/go-logr/logr"
+	"go.opentelemetry.io/otel/trace"
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
+
+	extv1beta1 "sigs.k8s.io/agent-sandbox/extensions/api/v1beta1"
+)
+
+// Sandbox manages the lifecycle of a single agent-sandbox instance.
+// Operations are split across Commands and Files.
+type Sandbox struct {
+	k8s       *K8sHelper
+	connector *connector
+	commands  *Commands
+	files     *Files
+	opts      Options
+	log       logr.Logger
+
+	claimName   string
+	sandboxName string
+	podName     string
+	podIP       string
+	serviceFQDN string
+	annotations map[string]string
+
+	lifecycleSem chan struct{}
+	mu           sync.Mutex
+	inflightOps  *sync.WaitGroup
+	draining     bool // set by Close before drain; checked by trackOp
+	openCancel   context.CancelFunc
+
+	tracer           trace.Tracer
+	traceServiceName string
+	lifecycleSpan    trace.Span
+	lifecycleCtx     context.Context
+}
+
+// Compile-time interface checks.
+var (
+	_ Handle = (*Sandbox)(nil)
+	_ Info   = (*Sandbox)(nil)
+)
+
+// New creates a new Sandbox with the given options.
+// Call Open() to create a sandbox and establish connectivity.
+func New(_ context.Context, opts Options) (*Sandbox, error) {
+	opts.setDefaults()
+	if err := opts.validateCommon(); err != nil {
+		return nil, err
+	}
+
+	k8s := opts.K8sHelper
+	if k8s == nil {
+		var err error
+		k8s, err = NewK8sHelper(opts.RestConfig, opts.Logger)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	tracer, svcName := newTracer(opts)
+
+	// Select connection strategy based on options.
+	var strategy ConnectionStrategy
+	switch {
+	case opts.APIURL != "":
+		strategy = &DirectStrategy{URL: opts.APIURL}
+	case opts.Connectivity.isInCluster():
+		// Caller is on the pod network and has opted to dial
+		// the runtime on the pod IP.
+		ics := &inClusterStrategy{
+			httpPort:      opts.ServerPort,
+			useServiceDNS: opts.Connectivity == ConnectivityInClusterService,
+			log:           opts.Logger,
+			tracer:        tracer,
+			svcName:       svcName,
+		}
+		if opts.Runtime == RuntimeSandboxd {
+			ics.httpPort = opts.SandboxdRESTPort
+			ics.grpcPort = opts.SandboxdGRPCPort
+		}
+		strategy = ics
+	case opts.Runtime == RuntimeSandboxd:
+		// sandboxd talks to the sandbox pod, not the sandbox-router, and the
+		// default transport reaches it without pod-network access: a
+		// port-forward directly to the pod (validated earlier: GatewayName is
+		// rejected with RuntimeSandboxd).
+		strategy = &podTunnelStrategy{
+			restPort: opts.SandboxdRESTPort,
+			grpcPort: opts.SandboxdGRPCPort,
+			log:      opts.Logger,
+			tracer:   tracer,
+			svcName:  svcName,
+			tunnel: &portForwardTunnel{
+				name:       "sandboxd pod port-forward",
+				coreClient: k8s.CoreClient,
+				restConfig: k8s.RestConfig,
+				namespace:  opts.Namespace,
+				pfTimeout:  opts.PortForwardReadyTimeout,
+				log:        opts.Logger,
+			},
+		}
+	case opts.GatewayName != "":
+		strategy = &gatewayStrategy{
+			dynamicClient:    k8s.DynamicClient,
+			gatewayName:      opts.GatewayName,
+			gatewayNamespace: opts.GatewayNamespace,
+			gatewayScheme:    opts.GatewayScheme,
+			timeout:          opts.GatewayReadyTimeout,
+			log:              opts.Logger,
+			tracer:           tracer,
+			svcName:          svcName,
+		}
+	default:
+		strategy = &tunnelStrategy{
+			discoveryClient: k8s.DiscoveryClient,
+			namespace:       opts.Namespace,
+			log:             opts.Logger,
+			tracer:          tracer,
+			svcName:         svcName,
+			tunnel: &portForwardTunnel{
+				name:       "port-forward",
+				coreClient: k8s.CoreClient,
+				restConfig: k8s.RestConfig,
+				namespace:  opts.Namespace,
+				pfTimeout:  opts.PortForwardReadyTimeout,
+				log:        opts.Logger,
+			},
+		}
+	}
+
+	conn := newConnector(connectorConfig{
+		Strategy:            strategy,
+		Namespace:           opts.Namespace,
+		ServerPort:          opts.ServerPort,
+		RouterHeaders:       opts.Runtime != RuntimeSandboxd && !opts.Connectivity.isInCluster(),
+		RequestTimeout:      opts.RequestTimeout,
+		PerAttemptTimeout:   opts.PerAttemptTimeout,
+		HTTPTransport:       opts.HTTPTransport,
+		DisablePodIPRouting: opts.DisablePodIPRouting,
+		Log:                 opts.Logger,
+		Tracer:              tracer,
+		TraceServiceName:    svcName,
+	})
+
+	// Wire strategy connector references for death notifications (and, for
+	// the pod tunnel, gRPC target publication).
+	if ts, ok := strategy.(*tunnelStrategy); ok {
+		ts.tunnel.onDied = conn.SetLastError
+	}
+	if pts, ok := strategy.(*podTunnelStrategy); ok {
+		pts.connector = conn
+		pts.tunnel.onDied = conn.SetLastError
+	}
+	if ics, ok := strategy.(*inClusterStrategy); ok {
+		ics.connector = conn
+	}
+
+	s := &Sandbox{
+		k8s:              k8s,
+		connector:        conn,
+		opts:             opts,
+		log:              opts.Logger,
+		lifecycleSem:     make(chan struct{}, 1),
+		inflightOps:      &sync.WaitGroup{},
+		tracer:           tracer,
+		traceServiceName: svcName,
+	}
+
+	errPrefix := s.errPrefix
+	trackOp := s.trackOp
+	getLifecycleCtx := s.currentLifecycleCtx
+
+	s.commands = &Commands{
+		connector:    conn,
+		runtime:      opts.Runtime,
+		tracer:       tracer,
+		svcName:      svcName,
+		log:          opts.Logger,
+		errPrefix:    errPrefix,
+		trackOp:      trackOp,
+		lifecycleCtx: getLifecycleCtx,
+	}
+	s.files = &Files{
+		connector:    conn,
+		runtime:      opts.Runtime,
+		tracer:       tracer,
+		svcName:      svcName,
+		log:          opts.Logger,
+		maxDownload:  opts.MaxDownloadSize,
+		maxUpload:    opts.MaxUploadSize,
+		errPrefix:    errPrefix,
+		trackOp:      trackOp,
+		lifecycleCtx: getLifecycleCtx,
+	}
+
+	// The pod tunnel needs the resolved pod name at Connect time.
+	// The in-cluster strategy needs the pod IP.
+	if pts, ok := strategy.(*podTunnelStrategy); ok {
+		pts.getPodName = s.PodName
+	}
+	if ics, ok := strategy.(*inClusterStrategy); ok {
+		ics.getServiceFQDN = s.ServiceFQDN
+		ics.getPodIP = s.PodIP
+	}
+
+	return s, nil
+}
+
+// Open creates a SandboxClaim and waits for the sandbox to become ready,
+// then discovers the API URL based on the configured connection mode.
+// On failure after claim creation, a claim with a generated name is
+// automatically deleted; if deletion also fails, call Close() to retry.
+// A claim named by ClaimName is caller-owned and is left in place.
+func (s *Sandbox) Open(ctx context.Context) (retErr error) {
+	select {
+	case s.lifecycleSem <- struct{}{}:
+		defer func() { <-s.lifecycleSem }()
+	case <-ctx.Done():
+		return fmt.Errorf("sandbox[%s/%s]: open cancelled waiting for lifecycle lock: %w", s.opts.Namespace, s.ClaimName(), ctx.Err())
+	}
+
+	openCtx, openCancel := context.WithCancel(ctx)
+	s.mu.Lock()
+	s.openCancel = openCancel
+	s.mu.Unlock()
+	defer func() {
+		openCancel()
+		s.mu.Lock()
+		s.openCancel = nil
+		s.mu.Unlock()
+	}()
+
+	// Check connectivity outside s.mu to avoid nested lock ordering
+	// (s.mu → c.mu). The lifecycleSem serializes all lifecycle operations,
+	// so no concurrent mutation is possible between this check and the
+	// state reads below.
+	if s.connector.IsConnected() {
+		return ErrAlreadyOpen
+	}
+
+	s.mu.Lock()
+	if s.claimName != "" && s.sandboxName == "" {
+		s.mu.Unlock()
+		return ErrOrphanedClaim
+	}
+	reconnect := s.claimName != ""
+	s.mu.Unlock()
+
+	// Start lifecycle span.
+	s.mu.Lock()
+	if s.lifecycleSpan != nil {
+		s.lifecycleSpan.End()
+	}
+	lifecycleParent := trace.ContextWithSpan(context.Background(), trace.SpanFromContext(openCtx))
+	s.lifecycleCtx, s.lifecycleSpan = s.tracer.Start(lifecycleParent, s.traceServiceName+".lifecycle")
+	s.mu.Unlock()
+
+	// Inject lifecycle span into openCtx so child operations inherit it.
+	openCtx = trace.ContextWithSpan(openCtx, trace.SpanFromContext(s.lifecycleCtx))
+
+	defer func() {
+		if retErr != nil {
+			s.mu.Lock()
+			if s.lifecycleSpan != nil {
+				recordError(s.lifecycleSpan, retErr)
+				s.lifecycleSpan.End()
+				s.lifecycleSpan = nil
+				s.lifecycleCtx = nil
+			}
+			s.mu.Unlock()
+		}
+	}()
+
+	if reconnect {
+		return s.reconnect(openCtx)
+	}
+
+	if err := validateWarmPoolName(s.opts.WarmPoolName); err != nil {
+		return err
+	}
+
+	// Create claim, or adopt the existing one on conflict when asked to.
+	claim, err := s.k8s.createClaim(openCtx, newClaim(&s.opts, time.Now()), s.tracer, s.traceServiceName)
+	if err != nil {
+		if !s.opts.AdoptExisting || !k8serrors.IsAlreadyExists(err) {
+			return err
+		}
+		if claim, err = s.adoptClaim(openCtx); err != nil {
+			return err
+		}
+	}
+	claimName := claim.Name
+	s.mu.Lock()
+	s.claimName = claimName
+	s.mu.Unlock()
+
+	// Resolve sandbox name (may differ from claim name with warm pool).
+	resolveStart := time.Now()
+	sandboxName, err := s.k8s.resolveSandboxName(openCtx, claimName, s.opts.Namespace, claim.UID, s.opts.SandboxReadyTimeout, s.tracer, s.traceServiceName)
+	if err != nil {
+		return s.rollbackOpen(err)
+	}
+	s.connector.SetIdentity(sandboxName)
+
+	// Subtract resolution time from the ready timeout budget.
+	remainingTimeout := s.opts.SandboxReadyTimeout - time.Since(resolveStart)
+	if remainingTimeout <= 0 {
+		return s.rollbackOpen(fmt.Errorf("%w: sandbox name resolution consumed the entire timeout budget", ErrTimeout))
+	}
+
+	// Wait for sandbox to be ready.
+	state, err := s.k8s.waitForSandboxReady(openCtx, sandboxName, s.opts.Namespace, remainingTimeout, s.tracer, s.traceServiceName)
+	if err != nil {
+		return s.rollbackOpen(err)
+	}
+	s.setState(state)
+	s.connector.SetPodIP(state.PodIP)
+
+	// Connect transport.
+	if err := s.connector.Connect(openCtx); err != nil {
+		return s.rollbackOpen(err)
+	}
+
+	return nil
+}
+
+// adoptClaim fetches the existing claim named by ClaimName after a create
+// conflict and checks that it is safe to attach to: it must not be
+// terminating and must reference exactly the requested warm pool.
+func (s *Sandbox) adoptClaim(ctx context.Context) (*extv1beta1.SandboxClaim, error) {
+	name, ns := s.opts.ClaimName, s.opts.Namespace
+	existing, err := s.k8s.getClaim(ctx, name, ns, s.tracer, s.traceServiceName)
+	if err != nil {
+		return nil, fmt.Errorf("%w: getting existing claim %s in %s after conflict: %w", ErrClaimFailed, name, ns, err)
+	}
+	if existing.DeletionTimestamp != nil {
+		return nil, fmt.Errorf("%w: existing claim %s in %s is terminating", ErrSandboxDeleted, name, ns)
+	}
+	if existing.Spec.WarmPoolRef.Name != s.opts.WarmPoolName {
+		return nil, fmt.Errorf("%w: existing claim %s in %s references warm pool %q, not %q", ErrClaimFailed, name, ns, existing.Spec.WarmPoolRef.Name, s.opts.WarmPoolName)
+	}
+	s.log.Info("claim adopted", "claim", name, "namespace", ns)
+	return existing, nil
+}
+
+func (s *Sandbox) reconnect(ctx context.Context) error {
+	ctx, span := startSpan(ctx, s.tracer, s.traceServiceName, "reconnect")
+	defer span.End()
+
+	reconnCtx := ctx
+	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+		var reconnCancel context.CancelFunc
+		reconnCtx, reconnCancel = context.WithTimeout(ctx, s.opts.SandboxReadyTimeout)
+		defer reconnCancel()
+	}
+
+	claimName := s.ClaimName()
+	sandboxName := s.SandboxName()
+	s.log.Info("reconnecting transport", "claim", claimName, "sandbox", sandboxName)
+
+	if err := s.k8s.verifyClaimExists(reconnCtx, claimName, s.opts.Namespace, s.tracer, s.traceServiceName); err != nil {
+		s.mu.Lock()
+		if k8serrors.IsNotFound(err) {
+			s.claimName = ""
+			s.sandboxName = ""
+			s.podName = ""
+			s.podIP = ""
+			s.serviceFQDN = ""
+			s.annotations = nil
+			s.mu.Unlock()
+			retErr := fmt.Errorf("%w: %w", ErrSandboxDeleted, err)
+			recordError(span, retErr)
+			return retErr
+		}
+		s.sandboxName = ""
+		s.podName = ""
+		s.podIP = ""
+		s.serviceFQDN = ""
+		s.annotations = nil
+		s.mu.Unlock()
+		recordError(span, err)
+		return fmt.Errorf("%w: %w", ErrOrphanedClaim, err)
+	}
+
+	state, err := s.k8s.verifySandboxAlive(reconnCtx, sandboxName, s.opts.Namespace, s.tracer, s.traceServiceName)
+	if err != nil {
+		s.mu.Lock()
+		if k8serrors.IsNotFound(err) {
+			s.sandboxName = ""
+			s.podName = ""
+			s.podIP = ""
+			s.serviceFQDN = ""
+			s.annotations = nil
+		}
+		// Non-NotFound: sandboxName preserved so the next Open() can re-verify
+		// instead of forcing the caller to Close() a potentially healthy sandbox.
+		s.mu.Unlock()
+		retErr := fmt.Errorf("%w: %w", ErrOrphanedClaim, err)
+		recordError(span, retErr)
+		return retErr
+	}
+	s.setState(state)
+
+	s.connector.SetIdentity(sandboxName)
+	s.connector.SetPodIP(state.PodIP)
+	if err := s.connector.Connect(reconnCtx); err != nil {
+		retErr := fmt.Errorf("sandbox: reconnect transport failed (sandbox is alive; retry Open): %w", err)
+		recordError(span, retErr)
+		return retErr
+	}
+	return nil
+}
+
+// rollbackOpen undoes a failed Open. Only a claim with a generated name is
+// deleted: another Open on the same ClaimName may have adopted a named claim.
+func (s *Sandbox) rollbackOpen(originalErr error) error {
+	_ = s.connector.Close()
+
+	s.mu.Lock()
+	name := s.claimName
+	s.mu.Unlock()
+
+	var cleanupErr error
+	if s.opts.ClaimName == "" {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), s.opts.CleanupTimeout)
+		defer cancel()
+
+		cleanupErr = s.k8s.deleteClaim(cleanupCtx, name, s.opts.Namespace)
+	}
+
+	s.mu.Lock()
+	s.sandboxName = ""
+	s.podName = ""
+	s.podIP = ""
+	s.serviceFQDN = ""
+	s.annotations = nil
+	if cleanupErr == nil {
+		s.claimName = ""
+	}
+	s.mu.Unlock()
+
+	if cleanupErr != nil {
+		s.log.Error(cleanupErr, "orphaned claim during Open rollback, could not delete", "claim", name)
+		return errors.Join(originalErr, fmt.Errorf("sandbox[%s/%s]: open rollback: %w", s.opts.Namespace, name, cleanupErr))
+	}
+	return originalErr
+}
+
+// Close deletes the SandboxClaim and cleans up resources.
+func (s *Sandbox) Close(ctx context.Context) error {
+	s.mu.Lock()
+	if s.openCancel != nil {
+		s.openCancel()
+	}
+	s.mu.Unlock()
+
+	// Allow up to 2x CleanupTimeout for semaphore acquisition so Close can
+	// wait for an in-progress Open that is itself running rollbackOpen with
+	// a detached CleanupTimeout context.
+	semCtx, semCancel := context.WithTimeout(context.Background(), 2*s.opts.CleanupTimeout)
+	defer semCancel()
+	select {
+	case s.lifecycleSem <- struct{}{}:
+		defer func() { <-s.lifecycleSem }()
+	default:
+		select {
+		case s.lifecycleSem <- struct{}{}:
+			defer func() { <-s.lifecycleSem }()
+		case <-ctx.Done():
+			return fmt.Errorf("sandbox[%s/%s]: close cancelled waiting for lifecycle lock: %w", s.opts.Namespace, s.ClaimName(), ctx.Err())
+		case <-semCtx.Done():
+			return fmt.Errorf("sandbox[%s/%s]: close timed out waiting for lifecycle lock", s.opts.Namespace, s.ClaimName())
+		}
+	}
+
+	// Single deadline for all remaining cleanup (drain + delete).
+	closeDeadline := time.Now().Add(s.opts.CleanupTimeout)
+
+	// Tear down transport first so new operations fail fast with
+	// ErrNotReady before we swap the WaitGroup. This closes a race
+	// where an operation could slip through trackOp (seeing draining=false,
+	// adding to the WG) and still reach a live transport.
+	_ = s.connector.Close()
+
+	// Atomically mark draining and swap the WaitGroup so trackOp cannot
+	// admit new operations to the old (draining) WaitGroup after this point.
+	s.mu.Lock()
+	s.draining = true
+	drainWG := s.inflightOps
+	s.inflightOps = &sync.WaitGroup{}
+	s.mu.Unlock()
+
+	drainDone := make(chan struct{})
+	go func() {
+		drainWG.Wait()
+		close(drainDone)
+	}()
+	drainBudget := max(
+		// reserve half for claim deletion
+		time.Until(closeDeadline)/2, 0)
+	drainTimer := time.NewTimer(drainBudget)
+	defer drainTimer.Stop()
+	select {
+	case <-drainDone:
+	case <-drainTimer.C:
+		s.log.Info("in-flight operations did not drain; proceeding with cleanup", "timeout", drainBudget)
+	}
+
+	// Delete claim using the remaining time budget.
+	s.mu.Lock()
+	name := s.claimName
+	s.mu.Unlock()
+
+	cleanupCtx, cancel := context.WithDeadline(context.Background(), closeDeadline)
+	defer cancel()
+	err := s.k8s.deleteClaim(cleanupCtx, name, s.opts.Namespace)
+
+	s.mu.Lock()
+	s.draining = false
+	s.sandboxName = ""
+	s.podName = ""
+	s.podIP = ""
+	s.serviceFQDN = ""
+	s.annotations = nil
+	if err != nil && s.claimName != "" {
+		s.log.Error(err, "orphaned claim during Close, could not delete; retry Close() to clean up", "claim", s.claimName)
+	} else {
+		s.claimName = ""
+	}
+	s.mu.Unlock()
+
+	// End lifecycle span.
+	s.mu.Lock()
+	if s.lifecycleSpan != nil {
+		if err != nil {
+			recordError(s.lifecycleSpan, err)
+		}
+		s.lifecycleSpan.End()
+		s.lifecycleSpan = nil
+		s.lifecycleCtx = nil
+	}
+	s.mu.Unlock()
+
+	if err != nil {
+		return fmt.Errorf("sandbox[%s/%s]: close: %w", s.opts.Namespace, name, err)
+	}
+	return nil
+}
+
+// Disconnect closes the transport connection without deleting the
+// SandboxClaim. The sandbox stays alive on the server. Call Open()
+// to reconnect. Disconnect is safe to call concurrently with Open;
+// an in-progress Open is cancelled before the transport is torn down.
+func (s *Sandbox) Disconnect(ctx context.Context) error {
+	s.mu.Lock()
+	if s.openCancel != nil {
+		s.openCancel()
+	}
+	s.mu.Unlock()
+
+	timer := time.NewTimer(s.opts.CleanupTimeout)
+	defer timer.Stop()
+	select {
+	case s.lifecycleSem <- struct{}{}:
+		defer func() { <-s.lifecycleSem }()
+	case <-ctx.Done():
+		return fmt.Errorf("sandbox[%s/%s]: disconnect cancelled waiting for lifecycle lock: %w", s.opts.Namespace, s.ClaimName(), ctx.Err())
+	case <-timer.C:
+		// openCancel() above signals a stuck Open to abort and release the
+		// semaphore. We intentionally do NOT call connector.Close() here:
+		// it would race with a just-succeeding Open() and tear down a live
+		// transport, leaving the caller with a nil error from Open() but a
+		// dead connection.
+		return fmt.Errorf("sandbox[%s/%s]: disconnect timed out waiting for lifecycle lock", s.opts.Namespace, s.ClaimName())
+	}
+
+	// End lifecycle span since the session is being suspended.
+	// A subsequent Open() (reconnect) will start a new span.
+	s.mu.Lock()
+	if s.lifecycleSpan != nil {
+		s.lifecycleSpan.End()
+		s.lifecycleSpan = nil
+		s.lifecycleCtx = nil
+	}
+	s.mu.Unlock()
+
+	return s.connector.Close()
+}
+
+// IsReady returns true if the sandbox is ready for communication.
+func (s *Sandbox) IsReady() bool {
+	return s.connector.IsConnected()
+}
+
+// Commands returns the command execution sub-object.
+func (s *Sandbox) Commands() *Commands { return s.commands }
+
+// Files returns the file operations sub-object.
+func (s *Sandbox) Files() *Files { return s.files }
+
+// Convenience aliases that delegate to sub-objects.
+
+func (s *Sandbox) Run(ctx context.Context, command string, opts ...CallOption) (*ExecutionResult, error) {
+	return s.commands.Run(ctx, command, opts...)
+}
+func (s *Sandbox) Write(ctx context.Context, path string, content []byte, opts ...CallOption) error {
+	return s.files.Write(ctx, path, content, opts...)
+}
+
+// WriteReader streams content from an io.Reader without buffering the entire
+// payload. Streaming uploads use a single request attempt because a generic
+// reader cannot be replayed safely. Passing WithMaxAttempts with a value
+// greater than 1 returns an error; it is not silently reduced to one attempt.
+func (s *Sandbox) WriteReader(ctx context.Context, path string, content io.Reader, opts ...CallOption) error {
+	return s.files.WriteReader(ctx, path, content, opts...)
+}
+
+func (s *Sandbox) Read(ctx context.Context, path string, opts ...CallOption) ([]byte, error) {
+	return s.files.Read(ctx, path, opts...)
+}
+
+// ReadTo streams a file into a caller-owned io.Writer without buffering the
+// complete response. The destination is never closed.
+func (s *Sandbox) ReadTo(ctx context.Context, path string, destination io.Writer, opts ...CallOption) (int64, error) {
+	return s.files.ReadTo(ctx, path, destination, opts...)
+}
+
+func (s *Sandbox) List(ctx context.Context, path string, opts ...CallOption) ([]FileEntry, error) {
+	return s.files.List(ctx, path, opts...)
+}
+func (s *Sandbox) Exists(ctx context.Context, path string, opts ...CallOption) (bool, error) {
+	return s.files.Exists(ctx, path, opts...)
+}
+
+// Delete removes a file or directory (sandboxd runtime only; the legacy
+// python-runtime returns ErrUnsupportedByRuntime). Not part of the Handle
+// interface to avoid breaking existing implementers.
+func (s *Sandbox) Delete(ctx context.Context, path string, recursive bool, opts ...CallOption) error {
+	return s.files.Delete(ctx, path, recursive, opts...)
+}
+
+// Health returns sandboxd's report from GET /v1/health. It returns an
+// HTTPError while sandboxd is shutting down, and ErrUnsupportedByRuntime on
+// the legacy python-runtime. It does not retry unless WithMaxAttempts is set.
+// Not part of the Handle interface to avoid breaking existing implementers.
+func (s *Sandbox) Health(ctx context.Context, opts ...CallOption) (*Health, error) {
+	return getSandboxdJSON[Health](ctx, s, "health", opts)
+}
+
+// Metadata returns the workload-scoped configuration sandboxd serves from
+// GET /v1/metadata (sandboxd runtime only; the legacy python-runtime returns
+// ErrUnsupportedByRuntime). It does not retry unless WithMaxAttempts is set.
+// Not part of the Handle interface to avoid breaking existing implementers.
+func (s *Sandbox) Metadata(ctx context.Context, opts ...CallOption) (*Metadata, error) {
+	md, err := getSandboxdJSON[Metadata](ctx, s, "metadata", opts)
+	if err != nil {
+		return nil, err
+	}
+	if md.Env == nil {
+		md.Env = map[string]string{}
+	}
+	return md, nil
+}
+
+// getSandboxdJSON GETs the sandboxd REST endpoint /v1/<op> and decodes its
+// JSON body into a T. op doubles as the span and error-message operation name.
+func getSandboxdJSON[T any](ctx context.Context, s *Sandbox, op string, opts []CallOption) (*T, error) {
+	defer s.trackOp()()
+	ctx, callCancel, maxAttempts := applyCallOptsNoRetry(ctx, opts)
+	defer callCancel()
+	ctx, span := startSpan(withLifecycleSpan(ctx, s.currentLifecycleCtx()), s.tracer, s.traceServiceName, op)
+	defer span.End()
+
+	fail := func(err error) (*T, error) {
+		recordError(span, err)
+		return nil, err
+	}
+
+	if s.opts.Runtime != RuntimeSandboxd {
+		return fail(fmt.Errorf("%s: %s: %w: the legacy python-runtime has no %s endpoint", s.errPrefix(), op, ErrUnsupportedByRuntime, op))
+	}
+	resp, err := s.connector.SendRequest(ctx, http.MethodGet, "v1/"+op, nil, "", maxAttempts)
+	if err != nil {
+		return fail(fmt.Errorf("%s: %s failed: %w", s.errPrefix(), op, err))
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fail(fmt.Errorf("%s: %s: %w", s.errPrefix(), op, newHTTPError(resp, op, RuntimeSandboxd)))
+	}
+	defer func() { _, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxDrainBytes)) }()
+
+	var out T
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxMetadataResponseSize)).Decode(&out); err != nil {
+		return fail(fmt.Errorf("%s: failed to decode %s response: %w", s.errPrefix(), op, err))
+	}
+	return &out, nil
+}
+
+// Info accessors.
+
+func (s *Sandbox) ClaimName() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.claimName
+}
+
+func (s *Sandbox) SandboxName() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.sandboxName
+}
+
+func (s *Sandbox) PodName() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.podName
+}
+
+func (s *Sandbox) PodIP() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.podIP
+}
+
+// ServiceFQDN returns the in-cluster DNS name of the Sandbox's headless
+// Service, or "" when it has none (spec.service unset or false). Not part of
+// the Info interface, which is frozen for backward compatibility.
+func (s *Sandbox) ServiceFQDN() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.serviceFQDN
+}
+
+func (s *Sandbox) Annotations() map[string]string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.annotations == nil {
+		return nil
+	}
+	cp := make(map[string]string, len(s.annotations))
+	maps.Copy(cp, s.annotations)
+	return cp
+}
+
+func (s *Sandbox) currentLifecycleCtx() context.Context {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.lifecycleCtx
+}
+
+func (s *Sandbox) errPrefix() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.claimName != "" {
+		return fmt.Sprintf("sandbox[%s/%s]", s.opts.Namespace, s.claimName)
+	}
+	return "sandbox"
+}
+
+// trackOp increments the in-flight counter so Close can drain before
+// deleting the claim. The draining flag and WaitGroup swap under s.mu
+// in Close guarantee mutual exclusion: trackOp either sees draining
+// (no-op) or Close's drain captures the WaitGroup. The gap before
+// SendRequest is safe because SendRequest re-checks baseURL per attempt.
+func (s *Sandbox) trackOp() func() {
+	s.mu.Lock()
+	if s.draining {
+		s.mu.Unlock()
+		return func() {}
+	}
+	wg := s.inflightOps
+	wg.Add(1)
+	s.mu.Unlock()
+	return wg.Done
+}
+
+func (s *Sandbox) setState(state *sandboxState) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.sandboxName = state.SandboxName
+	s.podName = state.PodName
+	s.podIP = state.PodIP
+	s.serviceFQDN = state.ServiceFQDN
+	s.annotations = state.Annotations
+}

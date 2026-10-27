@@ -1,0 +1,481 @@
+# Copyright 2026 The Kubernetes Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""
+Integration test for PodSnapshotSandboxClient.
+"""
+
+import argparse
+import time
+import logging
+from kubernetes import config
+from k8s_agent_sandbox.gke_extensions.snapshots.podsnapshot_client import (
+    PodSnapshotSandboxClient,
+)
+from k8s_agent_sandbox.gke_extensions.snapshots.snapshot_engine import SnapshotResponse
+from k8s_agent_sandbox.models import (
+    SandboxDirectConnectionConfig,
+    SandboxLocalTunnelConnectionConfig,
+)
+
+
+WAIT_TIME_SECONDS = 10
+
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s", force=True
+)
+
+
+def test_snapshot_response(snapshot_response: SnapshotResponse, snapshot_name: str):
+    assert hasattr(
+        snapshot_response, "trigger_name"
+    ), "snapshot response missing 'trigger_name' attribute"
+
+    print(f"Trigger Name: {snapshot_response.trigger_name}")
+
+    assert snapshot_response.trigger_name.startswith(
+        snapshot_name
+    ), f"Expected trigger name prefix '{snapshot_name}', but got '{snapshot_response.trigger_name}'"
+    assert (
+        snapshot_response.success
+    ), f"Expected success=True, but got False. Reason: {snapshot_response.error_reason}"
+    assert snapshot_response.error_code == 0
+
+
+def wait_for_snapshot_ready(sandbox, snapshot_uid: str, max_retries: int = 30, sleep_time: int = 2) -> bool:
+    """Helper to poll until a specific snapshot UID is reported as ready."""
+    for _ in range(max_retries):
+        check_list = sandbox.snapshots.list()
+        if check_list.success and any(s.snapshot_uid == snapshot_uid for s in check_list.snapshots):
+            print(f"Snapshot '{snapshot_uid}' is ready.")
+            return True
+        time.sleep(sleep_time)
+    print(f"Warning: Snapshot '{snapshot_uid}' did not become ready in time.")
+    return False
+
+
+def test_manual_snapshots(client, sandbox, warmpool_name: str, namespace: str) -> tuple[str, str]:
+    """Tests creating manual snapshots and restoring a sandbox from the latest snapshot."""
+    first_snapshot_trigger_name = "test-snapshot-10"
+    second_snapshot_trigger_name = "test-snapshot-20"
+
+    time.sleep(WAIT_TIME_SECONDS)
+    print(
+        f"Creating first manual pod snapshot '{first_snapshot_trigger_name}' after {WAIT_TIME_SECONDS} seconds..."
+    )
+    snapshot_response = sandbox.snapshots.create(first_snapshot_trigger_name)
+    test_snapshot_response(snapshot_response, first_snapshot_trigger_name)
+    first_snapshot_uid = snapshot_response.snapshot_uid
+    print(f"First snapshot UID: {first_snapshot_uid}")
+
+    time.sleep(WAIT_TIME_SECONDS)
+
+    print(
+        f"\nCreating second manual pod snapshot '{second_snapshot_trigger_name}' after {WAIT_TIME_SECONDS} seconds..."
+    )
+    snapshot_response = sandbox.snapshots.create(second_snapshot_trigger_name)
+    test_snapshot_response(snapshot_response, second_snapshot_trigger_name)
+    second_snapshot_uid = snapshot_response.snapshot_uid
+    print(f"Recent snapshot UID: {second_snapshot_uid}")
+
+    # Wait longer for the PodSnapshot controller's cache to recognize the new snapshot as the latest
+    print(f"Waiting for second snapshot '{second_snapshot_uid}' to become ready...")
+    wait_for_snapshot_ready(sandbox, second_snapshot_uid)
+
+    print(
+        f"\nChecking if sandbox was restored from latest snapshot '{second_snapshot_uid}'..."
+    )
+
+    return first_snapshot_uid, second_snapshot_uid
+
+
+def test_suspend_resume(sandbox) -> str:
+    """Tests suspending and resuming a sandbox and verifying it restored correctly."""
+    print("\n======= Testing Suspend and Resume =======")
+
+    print(f"\nSuspending sandbox '{sandbox.sandbox_id}'...")
+    suspend_result = sandbox.suspend(snapshot_before_suspend=True)
+    assert suspend_result.success, f"Suspend failed: {suspend_result.error_reason}"
+    assert sandbox.is_suspended(), "Sandbox should be suspended."
+    suspend_third_snapshot_uid = suspend_result.snapshot_response.snapshot_uid if suspend_result.snapshot_response else 'None'
+    print(f"Sandbox suspended. Snapshot UID: {suspend_third_snapshot_uid}")
+
+    print(f"Waiting for suspend snapshot '{suspend_third_snapshot_uid}' to become ready...")
+    wait_for_snapshot_ready(sandbox, suspend_third_snapshot_uid)
+
+    print(f"\nResuming sandbox '{sandbox.sandbox_id}'...")
+    resume_result = sandbox.resume()
+    assert resume_result.success, f"Resume failed: {resume_result.error_reason}"
+    assert resume_result.restored_from_snapshot, "Sandbox should have been restored from snapshot."
+    assert not sandbox.is_suspended(), "Sandbox should not be suspended after resume."
+    print(f"Sandbox resumed. Restored from Snapshot UID: {resume_result.snapshot_uid}")
+    
+    return suspend_third_snapshot_uid
+
+
+def test_suspend_resume_new_sandbox(client, warmpool_name: str, namespace: str) -> None:
+    """
+    Tests creating a sandbox, suspending it (generating a snapshot), terminating it, 
+    provisioning a sandbox handle for the same sandbox, and resuming the sandbox from that snapshot.
+    """
+    print("\n======= Testing Suspend and Resume in a NEW Sandbox =======")
+
+    # Create the initial sandbox to take the snapshot from
+    print(f"Creating initial sandbox from warm pool '{warmpool_name}'...")
+    sandbox = client.create_sandbox(warmpool_name, namespace=namespace)
+    print(f"Initial sandbox '{sandbox.sandbox_id}' ready.")
+
+    print(f"\nSuspending current sandbox '{sandbox.sandbox_id}'...")
+    suspend_result = sandbox.suspend(snapshot_before_suspend=True)
+    assert suspend_result.success, f"Suspend failed: {suspend_result.error_reason}"
+    assert sandbox.is_suspended(), "Sandbox should be suspended."
+    suspend_snapshot_uid = suspend_result.snapshot_response.snapshot_uid if suspend_result.snapshot_response else 'None'
+    print(f"Sandbox suspended. Snapshot UID: {suspend_snapshot_uid}")   
+
+    print(f"Waiting for suspend snapshot '{suspend_snapshot_uid}' to become ready...")
+    wait_for_snapshot_ready(sandbox, suspend_snapshot_uid)
+
+    claim_name = sandbox.claim_name
+    print("Closing connection for the old sandbox handle...")
+    sandbox.close_connection()
+
+    print(f"\nRe-attaching to sandbox claim '{claim_name}' to get a fresh handle...")
+    new_sandbox_handle = client.get_sandbox(claim_name, namespace=namespace)
+
+    print(f"\nResuming sandbox '{new_sandbox_handle.sandbox_id}'...")
+    resume_result = new_sandbox_handle.resume()
+    assert resume_result.success, f"Resume failed: {resume_result.error_reason}"
+    assert resume_result.restored_from_snapshot, "Sandbox should have been restored from snapshot."
+    assert not new_sandbox_handle.is_suspended(), "Sandbox should not be suspended after resume."
+    print(f"Sandbox successfully resumed and restored from Snapshot UID: {resume_result.snapshot_uid}")
+
+    # Cleanup snapshots
+    print(f"\nRunning cleanup of remaining snapshots on the restored sandbox '{new_sandbox_handle.sandbox_id}'...")
+    list_result = new_sandbox_handle.snapshots.list()
+    assert list_result.success, list_result.error_reason
+    print(f"Found {len(list_result.snapshots)} snapshots remaining for the sandbox.")
+    
+    delete_result = new_sandbox_handle.snapshots.delete_all(delete_by="all")
+    assert delete_result.success, delete_result.error_reason
+    print("Cleaned up remaining snapshots.")
+
+
+def test_timestamp_based_listing_and_deletion(sandbox, creation_time, suspend_third_snapshot_uid):
+    """Helper to verify listing and deleting snapshots by timestamp."""
+    print(f"\nListing snapshots created after '{creation_time}'...")
+    # Test listing with timestamp filter
+    list_after = sandbox.snapshots.list(filter_by={"created_after": creation_time})
+    assert list_after.success
+    assert len(list_after.snapshots) >= 1
+    assert list_after.snapshots[0].snapshot_uid == suspend_third_snapshot_uid
+    for snap in list_after.snapshots:
+        print(
+            f"Snapshot UID: {snap.snapshot_uid}, Source Pod: {snap.source_pod}, Creation Time: {snap.creation_timestamp}"
+        )
+
+    print(
+        f"\nDeleting snapshots created after '{creation_time}' of the sandbox '{sandbox.sandbox_id}'..."
+    )
+    delete_result = sandbox.snapshots.delete_all(delete_by="created_after", timestamp=creation_time)
+    assert delete_result.success, delete_result.error_reason
+    assert len(delete_result.deleted_snapshots) >= 1
+    assert suspend_third_snapshot_uid in delete_result.deleted_snapshots
+    print(f"Snapshots deleted successfully: {delete_result.deleted_snapshots}")
+
+
+def test_list_and_delete(sandbox, first_snapshot_uid: str, second_snapshot_uid: str, suspend_third_snapshot_uid: str):
+    """Tests listing all snapshots and verifying snapshot deletion."""
+    print("\n======= Testing List and Delete =======")
+    print(f"\nListing all snapshots for sandbox '{sandbox.sandbox_id}'...")
+    list_result = sandbox.snapshots.list()
+    assert list_result.success, list_result.error_reason
+
+    for snap in list_result.snapshots:
+        print(
+            f"Snapshot UID: {snap.snapshot_uid}, Source Pod: {snap.source_pod}, Creation Time: {snap.creation_timestamp}"
+        )
+    assert (
+        len(list_result.snapshots) == 3
+    ), f"Expected 3 snapshots, but got {len(list_result.snapshots)}"
+    assert (
+        list_result.snapshots[0].snapshot_uid == suspend_third_snapshot_uid
+    ), f"Expected most recent snapshot UID '{suspend_third_snapshot_uid}', but got '{list_result.snapshots[0].snapshot_uid}'"
+    assert (
+        list_result.snapshots[2].snapshot_uid == first_snapshot_uid
+    ), f"Expected older snapshot UID '{first_snapshot_uid}', but got '{list_result.snapshots[2].snapshot_uid}'"
+
+    print(
+        f"\nDeleting second snapshot '{second_snapshot_uid}' by UID..."
+    )
+    delete_result = sandbox.snapshots.delete(snapshot_uid=second_snapshot_uid)
+    assert delete_result.success, delete_result.error_reason
+    assert len(delete_result.deleted_snapshots) == 1
+    assert delete_result.deleted_snapshots[0] == second_snapshot_uid
+    print(f"Snapshot '{second_snapshot_uid}' deleted successfully.")
+
+    creation_time_2 = list_result.snapshots[1].creation_timestamp
+    test_timestamp_based_listing_and_deletion(sandbox, creation_time_2, suspend_third_snapshot_uid)
+
+    print(f"\nDeleting all remaining snapshots for sandbox '{sandbox.sandbox_id}'...")
+    delete_result = sandbox.snapshots.delete_all()
+    assert delete_result.success, delete_result.error_reason
+    assert len(delete_result.deleted_snapshots) >= 1
+    assert first_snapshot_uid in delete_result.deleted_snapshots
+    print(f"Remaining snapshots deleted successfully: {delete_result.deleted_snapshots}")
+
+
+def test_restore_from_snapshot(sandbox, snapshot_uid: str):
+    """Tests restoring a sandbox from a previous snapshot."""
+    print("\n======= Testing Restore from Previous Snapshot =======")
+    
+    print(f"\nSuspending sandbox '{sandbox.sandbox_id}' before dedicated restore...")
+    suspend_result = sandbox.suspend(snapshot_before_suspend=False)
+    assert suspend_result.success, f"Suspend failed before restore: {suspend_result.error_reason}"
+    assert sandbox.is_suspended(), "Sandbox should be suspended."
+
+    print(f"\nRestoring sandbox '{sandbox.sandbox_id}' from snapshot '{snapshot_uid}'...")
+    restore_result = sandbox.restore(snapshot_uid=snapshot_uid)
+    
+    assert restore_result.success, f"Restore failed: {restore_result.error_reason}"
+    assert restore_result.restored_from_snapshot, "Sandbox should have been restored from snapshot."
+    assert restore_result.snapshot_uid == snapshot_uid, f"Expected restored snapshot UID '{snapshot_uid}', but got '{restore_result.snapshot_uid}'"
+    
+    print(f"Sandbox successfully restored from Snapshot UID: {restore_result.snapshot_uid}")
+
+
+def test_restore_fails_on_running_sandbox(sandbox, snapshot_uid: str):
+    """Tests that restore fails gracefully on a running sandbox."""
+    print("\n======= Testing Restore Fails on a Running Sandbox =======")
+    assert not sandbox.is_suspended(), "Sandbox should be running."
+    
+    result = sandbox.restore(snapshot_uid=snapshot_uid)
+    assert not result.success, "Expected restore to fail on a running sandbox."
+    assert "Sandbox is currently running and cannot be restored." in result.error_reason, f"Unexpected error message: {result.error_reason}"
+    print("Restore on a running sandbox failed gracefully as expected.")
+
+
+def test_suspend_resume_restore_cycle(sandbox) -> tuple[str, str]:
+    """Tests a full suspend, resume, suspend, and restore cycle."""
+    print("\n======= Testing Suspend-Resume-Suspend-Restore-Suspend-Resume Cycle =======")
+    
+    print("Suspending sandbox (1st time)...")
+    res_suspend1 = sandbox.suspend(snapshot_before_suspend=True)
+    assert res_suspend1.success, res_suspend1.error_reason
+    snap_a_uid = res_suspend1.snapshot_response.snapshot_uid
+    print(f"1st Suspend snapshot: {snap_a_uid}")
+    assert wait_for_snapshot_ready(sandbox, snap_a_uid), f"Snapshot '{snap_a_uid}' did not become ready in time."
+    
+    print("Resuming sandbox (1st time)...")
+    res_resume = sandbox.resume()
+    assert res_resume.success, res_resume.error_reason
+    assert res_resume.restored_from_snapshot
+    assert res_resume.snapshot_uid == snap_a_uid
+    
+    print("Suspending sandbox (2nd time)...")
+    res_suspend2 = sandbox.suspend(snapshot_before_suspend=True)
+    assert res_suspend2.success, res_suspend2.error_reason
+    snap_b_uid = res_suspend2.snapshot_response.snapshot_uid
+    print(f"2nd Suspend snapshot: {snap_b_uid}")
+    assert wait_for_snapshot_ready(sandbox, snap_b_uid), f"Snapshot '{snap_b_uid}' did not become ready in time."
+    
+    print(f"Restoring sandbox back to 1st snapshot '{snap_a_uid}'...")
+    res_restore = sandbox.restore(snapshot_uid=snap_a_uid)
+    assert res_restore.success, res_restore.error_reason
+    assert res_restore.restored_from_snapshot
+    assert res_restore.snapshot_uid == snap_a_uid
+    
+    print("Suspending sandbox (3rd time, after restoration)...")
+    res_suspend3 = sandbox.suspend(snapshot_before_suspend=True)
+    assert res_suspend3.success, res_suspend3.error_reason
+    snap_c_uid = res_suspend3.snapshot_response.snapshot_uid
+    print(f"3rd Suspend snapshot: {snap_c_uid}")
+    assert wait_for_snapshot_ready(sandbox, snap_c_uid), f"Snapshot '{snap_c_uid}' did not become ready in time."
+    
+    print("Resuming sandbox (after restoration)...")
+    res_resume2 = sandbox.resume()
+    assert res_resume2.success, res_resume2.error_reason
+    assert res_resume2.restored_from_snapshot
+    assert res_resume2.snapshot_uid == snap_c_uid
+
+    print("Suspend-Resume-Suspend-Restore cycle (with subsequent suspend-resume) completed successfully.")
+    return snap_a_uid, snap_b_uid
+
+def main(
+    warmpool_name: str,
+    api_url: str | None,
+    namespace: str,
+    server_port: int,
+):
+    """
+    Tests the Sandbox client by creating a sandbox, running a command,
+    and then cleaning up.
+    """
+
+    print(
+        f"--- Starting Sandbox Client Test (Namespace: {namespace}, Port: {server_port}) ---"
+    )
+
+    # Load kube config
+    try:
+        config.load_incluster_config()
+    except config.ConfigException:
+        config.load_kube_config()
+
+    client = None
+    try:
+        print("\n***** Phase 1: Starting Counter *****")
+
+        if api_url:
+            connection_config = SandboxDirectConnectionConfig(
+                api_url=api_url, server_port=server_port
+            )
+        else:
+            connection_config = SandboxLocalTunnelConnectionConfig(
+                server_port=server_port
+            )
+
+        client = PodSnapshotSandboxClient(connection_config=connection_config)
+
+        print("\n======= Testing Pod Snapshot Extension =======")
+
+        sandbox = client.create_sandbox(warmpool_name, namespace=namespace)
+        
+        first_snapshot_uid, second_snapshot_uid = test_manual_snapshots(
+            client, sandbox, warmpool_name, namespace
+        )
+        suspend_third_snapshot_uid = test_suspend_resume(sandbox)
+        
+        time.sleep(WAIT_TIME_SECONDS)
+        
+        test_restore_from_snapshot(sandbox, first_snapshot_uid)
+
+        test_restore_fails_on_running_sandbox(sandbox, first_snapshot_uid)
+        
+        test_list_and_delete(
+            sandbox, first_snapshot_uid, second_snapshot_uid, suspend_third_snapshot_uid
+        )
+        
+        test_suspend_resume_restore_cycle(sandbox)
+        
+        print("\nCleaning up remaining snapshots from extra tests...")
+        delete_result = sandbox.snapshots.delete_all(delete_by="all")
+        assert delete_result.success, delete_result.error_reason
+
+        # Create a fresh sandbox to test suspend-resume flow on a brand new instance
+        print("\n***** Phase 2: Testing Suspend/Resume on a new Sandbox *****")
+        test_suspend_resume_new_sandbox(client, warmpool_name, namespace)
+
+        print("--- Pod Snapshot Test Passed! ---")
+
+    except Exception as e:
+        print(f"\n--- An error occurred during the test: {e} ---")
+    finally:
+        try:
+            display_prometheus_latency_metrics()
+        except Exception as metrics_err:
+            print(f"Failed to display Prometheus metrics: {metrics_err}")
+            
+        print("Cleaning up all sandboxes...")
+        if client:
+            client.delete_all()
+        print("\n--- Sandbox Client Test Finished ---")
+
+
+def display_prometheus_latency_metrics():
+    import prometheus_client
+    print("\n======= Prometheus Client Latency Metrics =======")
+    
+    def calculate_quantile(q: float, buckets: list[tuple[float, float]], total_count: float) -> float:
+        if total_count == 0:
+            return 0.0
+        sorted_buckets = sorted(buckets, key=lambda x: x[0])
+        rank = q * total_count
+        prev_le = 0.0
+        prev_count = 0.0
+        for le, count in sorted_buckets:
+            if count >= rank:
+                if le == float('inf'):
+                    return prev_le
+                if count == prev_count:
+                    return le
+                fraction = (rank - prev_count) / (count - prev_count)
+                return prev_le + (le - prev_le) * fraction
+            prev_le = le
+            prev_count = count
+        return sorted_buckets[-1][0] if sorted_buckets else 0.0
+
+    for metric in prometheus_client.REGISTRY.collect():
+        if metric.name in (
+            "sandbox_client_suspend_latency_ms",
+            "sandbox_client_resume_latency_ms",
+            "sandbox_client_restore_latency_ms",
+        ):
+            print(f"\nMetric: {metric.name}")
+            
+            series = {}  # label-tuple -> {"count": float, "buckets": [(le, count), ...]}
+            
+            for sample in metric.samples:
+                label_key = tuple(sorted((k, v) for k, v in sample.labels.items() if k != "le"))
+                entry = series.setdefault(label_key, {"count": 0.0, "buckets": []})
+                if sample.name.endswith("_count"):
+                    entry["count"] = sample.value
+                elif sample.name.endswith("_bucket"):
+                    le_str = sample.labels.get("le")
+                    le_val = float('inf') if le_str == "+Inf" else float(le_str)
+                    entry["buckets"].append((le_val, sample.value))
+            
+            total_count = sum(v["count"] for v in series.values())
+            if total_count > 0:
+                for label_key, v in series.items():
+                    if v["count"] == 0:
+                        continue
+                    p50 = calculate_quantile(0.5, v["buckets"], v["count"])
+                    p90 = calculate_quantile(0.9, v["buckets"], v["count"])
+                    p99 = calculate_quantile(0.99, v["buckets"], v["count"])
+                    print(f"  {dict(label_key)}: p50={p50:.2f}ms p90={p90:.2f}ms p99={p99:.2f}ms")
+            else:
+                print("  No metrics recorded (Count: 0)")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Test the Sandbox client.")
+    parser.add_argument(
+        "--warmpool-name",
+        default="python-sandbox-pool",
+        help="The name of the sandbox warm pool to use for the test.",
+    )
+
+    parser.add_argument(
+        "--api-url",
+        help="Direct URL to router (e.g. http://localhost:8080)",
+        default=None,
+    )
+    parser.add_argument(
+        "--namespace", default="default", help="Namespace to create sandbox in"
+    )
+    parser.add_argument(
+        "--server-port",
+        type=int,
+        default=8888,
+        help="Port the sandbox container listens on",
+    )
+
+    args = parser.parse_args()
+
+    main(
+        warmpool_name=args.warmpool_name,
+        api_url=args.api_url,
+        namespace=args.namespace,
+        server_port=args.server_port,
+    )

@@ -1,0 +1,439 @@
+# Copyright 2026 The Kubernetes Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import unittest
+
+from unittest.mock import MagicMock, patch
+
+
+from k8s_agent_sandbox.sandbox import Sandbox
+from k8s_agent_sandbox.models import (
+    SandboxInClusterConnectionConfig,
+    SandboxLocalTunnelConnectionConfig,
+    SandboxTracerConfig,
+)
+from k8s_agent_sandbox.utils import select_pod_ip
+
+
+class TestSandbox(unittest.TestCase):
+
+    @patch('k8s_agent_sandbox.sandbox.Filesystem')
+    @patch('k8s_agent_sandbox.sandbox.CommandExecutor')
+    @patch('k8s_agent_sandbox.sandbox.create_tracer_manager')
+    @patch('k8s_agent_sandbox.sandbox.SandboxConnector')
+    @patch('k8s_agent_sandbox.sandbox.K8sHelper')
+    def setUp(self, mock_k8s_helper, mock_connector, mock_create_tracer_manager, mock_command_executor, mock_filesystem):
+        self.mock_k8s_helper_cls = mock_k8s_helper
+        self.mock_connector_cls = mock_connector
+        self.mock_create_tracer_manager_func = mock_create_tracer_manager
+        self.mock_command_executor_cls = mock_command_executor
+        self.mock_filesystem_cls = mock_filesystem
+
+        self.mock_k8s_helper = mock_k8s_helper.return_value
+        self.mock_connector = mock_connector.return_value
+        self.mock_tracer_manager = MagicMock()
+        self.mock_tracer = MagicMock()
+        mock_create_tracer_manager.return_value = (self.mock_tracer_manager, self.mock_tracer)
+        self.mock_command_executor = mock_command_executor.return_value
+        self.mock_filesystem = mock_filesystem.return_value
+
+        self.sandbox_id = "test-sandbox"
+        self.namespace = "test-namespace"
+        self.claim_name = "test-claim"
+
+        self.sandbox = Sandbox(
+            claim_name=self.claim_name,
+            sandbox_id=self.sandbox_id,
+            namespace=self.namespace,
+        )
+
+    def test_init_with_defaults(self):
+        """Tests sandbox initialization with default configurations."""
+        self.mock_k8s_helper_cls.assert_called_once()
+
+        self.mock_connector_cls.assert_called_once()
+        args, kwargs = self.mock_connector_cls.call_args
+        self.assertEqual(kwargs['sandbox_id'], self.sandbox_id)
+        self.assertEqual(kwargs['namespace'], self.namespace)
+        self.assertIsInstance(kwargs['connection_config'], SandboxLocalTunnelConnectionConfig)
+        self.assertEqual(kwargs['k8s_helper'], self.mock_k8s_helper)
+
+        self.mock_create_tracer_manager_func.assert_called_once()
+        self.assertIsInstance(self.mock_create_tracer_manager_func.call_args[0][0], SandboxTracerConfig)
+
+        self.mock_command_executor_cls.assert_called_once_with(self.mock_connector, self.mock_tracer, 'sandbox-client')
+        self.mock_filesystem_cls.assert_called_once_with(self.mock_connector, self.mock_tracer, 'sandbox-client')
+
+        self.assertEqual(self.sandbox.claim_name, self.claim_name)
+        self.assertEqual(self.sandbox.sandbox_id, self.sandbox_id)
+        self.assertEqual(self.sandbox.namespace, self.namespace)
+        self.assertFalse(self.sandbox._is_closed)
+
+    @patch('k8s_agent_sandbox.sandbox.Filesystem')
+    @patch('k8s_agent_sandbox.sandbox.CommandExecutor')
+    @patch('k8s_agent_sandbox.sandbox.create_tracer_manager')
+    @patch('k8s_agent_sandbox.sandbox.SandboxConnector')
+    @patch('k8s_agent_sandbox.sandbox.K8sHelper')
+    def test_init_with_custom_args(self, mock_k8s_helper, mock_connector, mock_create_tracer_manager, mock_command_executor, mock_filesystem):
+        """Tests sandbox initialization with custom arguments."""
+        mock_k8s_helper_instance = MagicMock()
+        mock_connection_config = MagicMock()
+        mock_tracer_config = SandboxTracerConfig(trace_service_name="custom-tracer")
+        mock_tracer, mock_manager = MagicMock(), MagicMock()
+        mock_create_tracer_manager.return_value = (mock_manager, mock_tracer)
+
+        sandbox = Sandbox(
+            sandbox_id="custom-id",
+            namespace="custom-ns",
+            claim_name="custom-claim",
+            connection_config=mock_connection_config,
+            tracer_config=mock_tracer_config,
+            k8s_helper=mock_k8s_helper_instance
+        )
+
+        mock_k8s_helper.assert_not_called()
+        self.assertEqual(sandbox.k8s_helper, mock_k8s_helper_instance)
+
+        mock_connector.assert_called_once_with(
+            sandbox_id="custom-id",
+            namespace="custom-ns",
+            connection_config=mock_connection_config,
+            k8s_helper=mock_k8s_helper_instance,
+            get_pod_ip=sandbox.get_pod_ip,
+            get_pod_name=sandbox.get_pod_name,
+            get_service_fqdn=sandbox.get_service_fqdn,
+        )
+
+        mock_create_tracer_manager.assert_called_once_with(mock_tracer_config)
+        mock_command_executor.assert_called_once_with(mock_connector.return_value, mock_tracer, "custom-tracer")
+        mock_filesystem.assert_called_once_with(mock_connector.return_value, mock_tracer, "custom-tracer")
+
+    @patch('k8s_agent_sandbox.sandbox.Filesystem')
+    @patch('k8s_agent_sandbox.sandbox.CommandExecutor')
+    @patch('k8s_agent_sandbox.sandbox.create_tracer_manager')
+    @patch('k8s_agent_sandbox.sandbox.SandboxConnector')
+    @patch('k8s_agent_sandbox.sandbox.K8sHelper')
+    def test_in_cluster_passes_pod_ip_callback(
+        self,
+        mock_k8s_helper,
+        mock_connector,
+        mock_create_tracer_manager,
+        mock_command_executor,
+        mock_filesystem,
+    ):
+        config = SandboxInClusterConnectionConfig()
+        mock_create_tracer_manager.return_value = (MagicMock(), MagicMock())
+
+        sandbox = Sandbox(
+            claim_name=self.claim_name,
+            sandbox_id=self.sandbox_id,
+            namespace=self.namespace,
+            connection_config=config,
+        )
+
+        callback = mock_connector.call_args.kwargs["get_pod_ip"]
+        self.assertIs(callback.__self__, sandbox)
+        self.assertIs(callback.__func__, Sandbox.get_pod_ip)
+
+    def test_get_pod_name_with_annotation(self):
+        self.mock_k8s_helper.get_sandbox.return_value = {
+            "metadata": {
+                "annotations": {
+                    'agents.x-k8s.io/pod-name': "annotated-pod-name"
+                }
+            }
+        }
+        self.assertEqual(self.sandbox.get_pod_name(), "annotated-pod-name")
+
+    def test_get_pod_name_fallback(self):
+        self.mock_k8s_helper.get_sandbox.return_value = None
+        self.assertEqual(self.sandbox.get_pod_name(), self.sandbox_id)
+
+    def test_get_pod_name_empty_annotation_falls_back(self):
+        self.mock_k8s_helper.get_sandbox.return_value = {
+            "metadata": {
+                "annotations": {
+                    'agents.x-k8s.io/pod-name': ""
+                }
+            }
+        }
+        self.assertEqual(self.sandbox.get_pod_name(), self.sandbox_id)
+
+        # The fallback value is cached and not re-queried from Kubernetes.
+        self.mock_k8s_helper.get_sandbox.reset_mock()
+        self.assertEqual(self.sandbox.get_pod_name(), self.sandbox_id)
+        self.mock_k8s_helper.get_sandbox.assert_not_called()
+
+    def test_status_not_found(self):
+        self.mock_k8s_helper.get_sandbox.return_value = None
+        status, message = self.sandbox.status()
+        
+        self.assertEqual(status, "SandboxNotFound")
+        self.assertEqual(message, "Sandbox object not found in Kubernetes.")
+        self.mock_k8s_helper.get_sandbox.assert_called_once_with(self.sandbox_id, self.namespace)
+
+    def test_status_ready(self):
+        self.mock_k8s_helper.get_sandbox.return_value = {
+            "status": {
+                "conditions": [
+                    {"type": "Ready", "status": "True", "message": ""}
+                ]
+            }
+        }
+        status, message = self.sandbox.status()
+        
+        self.assertEqual(status, "SandboxReady")
+        self.assertEqual(message, "")
+
+    def test_status_not_ready_with_message(self):
+        self.mock_k8s_helper.get_sandbox.return_value = {
+            "status": {
+                "conditions": [
+                    {"type": "Ready", "status": "False", "message": "Pod is initializing"}
+                ]
+            }
+        }
+        status, message = self.sandbox.status()
+        
+        self.assertEqual(status, "SandboxNotReady")
+        self.assertEqual(message, "Pod is initializing")
+
+    def test_status_no_ready_condition(self):
+        self.mock_k8s_helper.get_sandbox.return_value = {
+            "status": {
+                "conditions": [
+                    {"type": "PodScheduled", "status": "True"}
+                ]
+            }
+        }
+        status, message = self.sandbox.status()
+        
+        self.assertEqual(status, "SandboxNotReady")
+        self.assertEqual(message, "Unknown message")
+
+    def test_properties(self):
+        """Tests the commands and files properties."""
+        self.assertEqual(self.sandbox.commands, self.mock_command_executor)
+        self.assertEqual(self.sandbox.files, self.mock_filesystem)
+
+    def test_is_active(self):
+        """Tests the is_active property."""
+        self.assertTrue(self.sandbox.is_active)
+        self.sandbox._is_closed = True
+        self.assertFalse(self.sandbox.is_active)
+
+    def test_close_connection(self):
+        """Tests the public close_connection method."""
+        self.sandbox.close_connection()
+
+        self.mock_connector.close.assert_called_once()
+        self.assertIsNone(self.sandbox.commands)
+        self.assertIsNone(self.sandbox.files)
+        self.mock_tracer_manager.end_lifecycle_span.assert_called_once()
+        self.assertTrue(self.sandbox._is_closed)
+
+        # Test idempotency
+        self.mock_connector.close.reset_mock()
+        self.sandbox.close_connection()
+        self.mock_connector.close.assert_not_called()
+
+    @patch('k8s_agent_sandbox.sandbox.logger.error')
+    def test_close_connection_with_tracing_error(self, mock_logging_error):
+        """Tests close_connection with an error in tracing."""
+        self.mock_tracer_manager.end_lifecycle_span.side_effect = Exception("Tracer error")
+        self.sandbox.close_connection()
+
+        self.mock_connector.close.assert_called_once()
+        self.assertTrue(self.sandbox._is_closed)
+        mock_logging_error.assert_called_once_with("Failed to end tracing span: Tracer error")
+
+    def test_terminate(self):
+        """Tests the terminate method."""
+        with patch.object(self.sandbox, 'close_connection') as mock_close:
+            self.sandbox.terminate()
+            mock_close.assert_called_once()
+
+        self.mock_k8s_helper.delete_sandbox_claim.assert_called_once_with(self.claim_name, self.namespace)
+
+    def test_get_sandbox_name_hash_from_k8s(self):
+        """Tests retrieving sandbox name hash from status.selector when it is present."""
+        self.mock_k8s_helper.get_sandbox.return_value = {
+            "status": {
+                "selector": "agents.x-k8s.io/sandbox-name-hash=abc12345"
+            }
+        }
+        # Verify it returns correct parsed hash
+        self.assertEqual(self.sandbox.get_sandbox_name_hash(), "abc12345")
+        self.mock_k8s_helper.get_sandbox.assert_called_once_with(self.sandbox_id, self.namespace)
+
+    def test_get_sandbox_name_hash_returns_none_when_selector_missing(self):
+        """Tests that get_sandbox_name_hash returns None when status.selector is missing."""
+        self.mock_k8s_helper.get_sandbox.return_value = {
+            "status": {}
+        }
+        self.assertIsNone(self.sandbox.get_sandbox_name_hash())
+        self.mock_k8s_helper.get_sandbox.assert_called_once_with(self.sandbox_id, self.namespace)
+
+
+    def test_get_sandbox_name_hash_caching(self):
+        """Tests that sandbox name hash is cached and does not query Kubernetes repeatedly."""
+        self.mock_k8s_helper.get_sandbox.return_value = {
+            "status": {
+                "selector": "agents.x-k8s.io/sandbox-name-hash=mycachedhash"
+            }
+        }
+        # Call it once to populate cache
+        self.assertEqual(self.sandbox.get_sandbox_name_hash(), "mycachedhash")
+        
+        # Reset mock and call again - it should return cached value without querying K8s helper again
+        self.mock_k8s_helper.get_sandbox.reset_mock()
+        self.assertEqual(self.sandbox.get_sandbox_name_hash(), "mycachedhash")
+        self.mock_k8s_helper.get_sandbox.assert_not_called()
+
+    def test_get_pod_ip(self):
+        """Tests that get_pod_ip returns the pod IP when present."""
+        self.mock_k8s_helper.get_sandbox.return_value = {
+            "status": {
+                "podIPs": ["10.244.0.42"]
+            }
+        }
+        self.assertEqual(self.sandbox.get_pod_ip(), "10.244.0.42")
+
+    def test_get_pod_ip_prioritization_and_normalization(self):
+        """Tests that get_pod_ip uses select_pod_ip to prioritize and normalize IPs."""
+        self.mock_k8s_helper.get_sandbox.return_value = {
+            "status": {
+                "podIPs": ["::ffff:10.244.0.42", "2001:db8::1"]
+            }
+        }
+        self.assertEqual(self.sandbox.get_pod_ip(), "10.244.0.42")
+
+    def test_get_service_fqdn_uses_status_and_preserves_cluster_domain(self):
+        self.mock_k8s_helper.get_sandbox.return_value = {
+            "status": {"serviceFQDN": "my-sandbox.dev.svc.example.internal"}
+        }
+        self.assertEqual(
+            self.sandbox.get_service_fqdn(), "my-sandbox.dev.svc.example.internal"
+        )
+
+    def test_get_service_fqdn_returns_none_when_missing(self):
+        self.mock_k8s_helper.get_sandbox.return_value = {"status": {}}
+        self.assertIsNone(self.sandbox.get_service_fqdn())
+
+
+class TestSandboxTerminateIdempotent(unittest.TestCase):
+    """`Sandbox.terminate()` must be idempotent — a second call must not
+    issue a redundant DELETE."""
+
+    @patch('k8s_agent_sandbox.sandbox.Filesystem')
+    @patch('k8s_agent_sandbox.sandbox.CommandExecutor')
+    @patch('k8s_agent_sandbox.sandbox.create_tracer_manager')
+    @patch('k8s_agent_sandbox.sandbox.SandboxConnector')
+    def _build_sandbox(self, mock_connector, mock_tracer, mock_cmd, mock_files):
+        mock_tracer.return_value = (MagicMock(), MagicMock())
+        k8s_helper = MagicMock()
+        return Sandbox(
+            claim_name="my-claim",
+            sandbox_id="my-claim",
+            namespace="demo",
+            connection_config=SandboxLocalTunnelConnectionConfig(),
+            tracer_config=SandboxTracerConfig(),
+            k8s_helper=k8s_helper,
+        ), k8s_helper
+
+    def test_second_terminate_does_not_redelete(self):
+        sandbox, helper = self._build_sandbox()
+
+        sandbox.terminate()
+        self.assertEqual(helper.delete_sandbox_claim.call_count, 1)
+        self.assertIsNone(sandbox.claim_name)
+
+        # Second call must be a no-op.
+        sandbox.terminate()
+        self.assertEqual(helper.delete_sandbox_claim.call_count, 1)
+
+    def test_failed_terminate_preserves_claim_name_for_retry(self):
+        """When delete_sandbox_claim raises, claim_name must NOT be cleared —
+        otherwise a transient 5xx / network blip would hide the error and
+        the caller would have no handle to retry or clean up manually."""
+        sandbox, helper = self._build_sandbox()
+
+        helper.delete_sandbox_claim.side_effect = RuntimeError("transient 500")
+
+        with self.assertRaisesRegex(RuntimeError, "transient 500"):
+            sandbox.terminate()
+
+        # claim_name must be preserved so the caller can retry.
+        self.assertEqual(sandbox.claim_name, "my-claim")
+        self.assertEqual(helper.delete_sandbox_claim.call_count, 1)
+
+        # Retry succeeds and clears the handle.
+        helper.delete_sandbox_claim.side_effect = None
+        sandbox.terminate()
+        self.assertEqual(helper.delete_sandbox_claim.call_count, 2)
+        self.assertIsNone(sandbox.claim_name)
+
+
+
+class TestSelectPodIP(unittest.TestCase):
+    def test_select_pod_ip_empty(self):
+        self.assertIsNone(select_pod_ip(None))
+        self.assertIsNone(select_pod_ip([]))
+        self.assertIsNone(select_pod_ip(["", "   "]))
+
+    def test_select_pod_ip_single_ipv4(self):
+        self.assertEqual(select_pod_ip(["10.244.0.42"]), "10.244.0.42")
+
+    def test_select_pod_ip_single_ipv6(self):
+        self.assertEqual(select_pod_ip(["2001:db8::1"]), "2001:db8::1")
+
+    def test_select_pod_ip_dual_stack_ipv4_first(self):
+        self.assertEqual(select_pod_ip(["10.244.0.42", "2001:db8::1"]), "10.244.0.42")
+
+    def test_select_pod_ip_dual_stack_ipv6_first(self):
+        self.assertEqual(select_pod_ip(["2001:db8::1", "10.244.0.42"]), "10.244.0.42")
+
+    def test_select_pod_ip_multiple_ipv6_selects_first(self):
+        self.assertEqual(select_pod_ip(["2001:db8::1", "2001:db8::2"]), "2001:db8::1")
+
+    def test_select_pod_ip_skips_invalid(self):
+        self.assertEqual(select_pod_ip(["not-a-valid-ip", "10.244.0.42"]), "10.244.0.42")
+        self.assertEqual(select_pod_ip(["not-a-valid-ip", "2001:db8::1"]), "2001:db8::1")
+        self.assertIsNone(select_pod_ip(["not-a-valid-ip", "bad-address"]))
+
+    def test_select_pod_ip_whitespace_normalization(self):
+        self.assertEqual(select_pod_ip(["  192.168.1.1  "]), "192.168.1.1")
+
+    def test_select_pod_ip_ipv6_compression_normalization(self):
+        self.assertEqual(select_pod_ip(["2001:db8:0:0:0:0:2:1"]), "2001:db8::2:1")
+
+    def test_select_pod_ip_ipv4_mapped_ipv6_normalization(self):
+        self.assertEqual(select_pod_ip(["::ffff:10.0.0.1"]), "10.0.0.1")
+
+    def test_select_pod_ip_non_string(self):
+        class ObjWithIP:
+            def __init__(self, ip: str):
+                self.ip = ip
+
+        mixed_ips = [
+            None,
+            123,
+            {"ip": "2001:db8::1"},
+            ObjWithIP("10.244.0.42"),
+        ]
+        self.assertEqual(select_pod_ip(mixed_ips), "10.244.0.42")
+
+
+if __name__ == '__main__':
+    unittest.main()

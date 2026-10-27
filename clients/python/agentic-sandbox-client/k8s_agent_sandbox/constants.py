@@ -1,0 +1,58 @@
+# Copyright 2026 The Kubernetes Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Constants for API Groups and Resources
+GATEWAY_API_GROUP = "gateway.networking.k8s.io"
+GATEWAY_API_VERSION = "v1"
+GATEWAY_PLURAL = "gateways"
+
+CLAIM_API_GROUP = "extensions.agents.x-k8s.io"
+CLAIM_API_VERSION = "v1beta1"
+CLAIM_PLURAL_NAME = "sandboxclaims"
+
+SANDBOX_API_GROUP = "agents.x-k8s.io"
+SANDBOX_API_VERSION = "v1beta1"
+SANDBOX_PLURAL_NAME = "sandboxes"
+
+CLIENT_REQUEST_TIME_ANNOTATION = "agents.x-k8s.io/client-first-requested-at"
+# Deprecated: New Sandboxes use their own name for the backing pod while non-empty legacy annotations may still be honored.
+POD_NAME_ANNOTATION = "agents.x-k8s.io/pod-name"
+CREATED_BY_LABEL = "agents.x-k8s.io/created-by"
+PODSNAPSHOT_POD_NAME_ANNOTATION = "podsnapshot.gke.io/origin-pod"
+PODSNAPSHOT_NAME_ANNOTATION = "podsnapshot.gke.io/ps-name"
+SANDBOX_NAME_HASH_LABEL = "agents.x-k8s.io/sandbox-name-hash"
+
+PODSNAPSHOT_API_GROUP = "podsnapshot.gke.io"
+PODSNAPSHOT_API_VERSION = "v1"
+PODSNAPSHOT_PLURAL = "podsnapshots"
+PODSNAPSHOTMANUALTRIGGER_PLURAL = "podsnapshotmanualtriggers"
+PODSNAPSHOTMANUALTRIGGER_API_KIND = "PodSnapshotManualTrigger"
+PODSNAPSHOT_API_KIND = "PodSnapshot"
+
+# SandboxClaim Ready=False reasons the claim controller will not recover from
+# on its own (see computeReadyCondition in
+# extensions/controllers/sandboxclaim_controller.go). Watch-based ready-waits
+# fail fast on these instead of burning the full timeout. Transient reasons
+# (AdoptionPending, SandboxMissing, SandboxNotReady, ReconcilerError) are
+# intentionally absent: the controller retries those.
+TERMINAL_CLAIM_READY_REASONS = frozenset({
+    "InvalidMetadata",
+    "EnvVarsInjectionRejected",
+    "VolumeClaimTemplatesError",
+    "ClaimExpired",          # extensions ClaimExpiredReason
+    "SandboxExpired",        # core SandboxReasonExpired, forwarded to the claim
+    "InvalidConfiguration",  # core SandboxReasonInvalidConfiguration, forwarded to the claim
+    "PodFailed",             # core SandboxReasonPodFailed, forwarded to the claim
+    "PodSucceeded",          # core SandboxReasonPodSucceeded, forwarded to the claim
+})

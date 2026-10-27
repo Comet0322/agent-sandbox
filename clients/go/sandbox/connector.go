@@ -1,0 +1,519 @@
+// Copyright 2026 The Kubernetes Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package sandbox
+
+import (
+	"context"
+	cryptorand "crypto/rand"
+	"encoding/hex"
+	"fmt"
+	"io"
+	"math"
+	"math/rand/v2"
+	"net"
+	"net/http"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/go-logr/logr"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/trace"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+)
+
+const (
+	maxAttempts = 6
+	baseBackoff = 500 * time.Millisecond
+	maxBackoff  = 8 * time.Second
+
+	// maxDrainBytes caps how much of a response body is read to allow
+	// the underlying TCP connection to be reused by net/http's transport.
+	maxDrainBytes = 4 << 10
+)
+
+var retryableStatusCodes = map[int]bool{
+	http.StatusInternalServerError: true,
+	http.StatusBadGateway:          true,
+	http.StatusServiceUnavailable:  true,
+	http.StatusGatewayTimeout:      true,
+}
+
+// connector manages HTTP connectivity to the sandbox runtime, either directly
+// or through the sandbox-router. It owns the HTTP client, retry logic, and
+// delegates endpoint discovery to a ConnectionStrategy.
+type connector struct {
+	strategy   ConnectionStrategy
+	httpClient *http.Client
+
+	sandboxID           string // sandbox name, used as X-Sandbox-ID header
+	namespace           string
+	serverPort          int
+	baseURL             string
+	podIP               string
+	disablePodIPRouting bool
+	lastError           error
+
+	// routerHeaders controls whether X-Sandbox-* routing headers are sent.
+	// True only for transports that actually reach the sandbox-router; false
+	// for sandboxd and for any in-cluster dial, which address the pod and so
+	// have nothing to consume them.
+	routerHeaders bool
+	// grpcTarget is the dial address for sandboxd's ProcessService, published
+	// by whichever strategy resolved it (the pod tunnel once the port-forward
+	// is ready, or the in-cluster strategy once the address is known).
+	grpcTarget string
+	grpcConn   *grpc.ClientConn
+
+	requestTimeout    time.Duration
+	perAttemptTimeout time.Duration
+
+	mu           sync.Mutex
+	backoffScale float64 // test hook
+
+	ownsTransport bool
+	log           logr.Logger
+	tracer        trace.Tracer
+	svcName       string
+}
+
+// connectorConfig holds the parameters needed to construct a connector.
+type connectorConfig struct {
+	Strategy            ConnectionStrategy
+	Namespace           string
+	ServerPort          int
+	RouterHeaders       bool
+	RequestTimeout      time.Duration
+	PerAttemptTimeout   time.Duration
+	HTTPTransport       http.RoundTripper
+	DisablePodIPRouting bool
+	Log                 logr.Logger
+	Tracer              trace.Tracer
+	TraceServiceName    string
+}
+
+// newConnector creates a connector with the given configuration.
+func newConnector(cfg connectorConfig) *connector {
+	transport := cfg.HTTPTransport
+	if transport == nil {
+		transport = &http.Transport{
+			DialContext:           (&net.Dialer{Timeout: cfg.PerAttemptTimeout}).DialContext,
+			MaxIdleConns:          100,
+			MaxIdleConnsPerHost:   10,
+			IdleConnTimeout:       90 * time.Second,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ResponseHeaderTimeout: cfg.PerAttemptTimeout,
+			ExpectContinueTimeout: 1 * time.Second,
+		}
+	}
+	return &connector{
+		strategy:            cfg.Strategy,
+		namespace:           cfg.Namespace,
+		serverPort:          cfg.ServerPort,
+		routerHeaders:       cfg.RouterHeaders,
+		requestTimeout:      cfg.RequestTimeout,
+		perAttemptTimeout:   cfg.PerAttemptTimeout,
+		disablePodIPRouting: cfg.DisablePodIPRouting,
+		ownsTransport:       cfg.HTTPTransport == nil,
+		httpClient: &http.Client{
+			Transport: transport,
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		},
+		log:     cfg.Log,
+		tracer:  cfg.Tracer,
+		svcName: cfg.TraceServiceName,
+	}
+}
+
+// SetIdentity sets the sandbox name sent as X-Sandbox-ID.
+func (c *connector) SetIdentity(sandboxName string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.sandboxID = sandboxName
+}
+
+// SetPodIP sets the sandbox pod's IP address to be sent as X-Sandbox-Pod-IP.
+// The input is sanitized and validated to prevent net/http header injection errors.
+func (c *connector) SetPodIP(ip string) {
+	validIP := selectPodIP([]string{ip})
+	shouldLog := (validIP == "" && strings.TrimSpace(ip) != "")
+
+	c.mu.Lock()
+	c.podIP = validIP
+	c.mu.Unlock()
+
+	if shouldLog {
+		c.log.V(1).Info("skipping invalid pod IP address", "ip", ip)
+	}
+}
+
+// Connect delegates to the strategy to discover and set the base URL.
+func (c *connector) Connect(ctx context.Context) error {
+	url, err := c.strategy.Connect(ctx)
+	if err != nil {
+		return err
+	}
+	c.mu.Lock()
+	c.baseURL = url
+	c.lastError = nil
+	c.mu.Unlock()
+	mode := "direct"
+	switch s := c.strategy.(type) {
+	case *gatewayStrategy:
+		mode = "gateway"
+	case *tunnelStrategy:
+		mode = "port-forward"
+	case *podTunnelStrategy:
+		mode = "sandboxd-pod-tunnel"
+	case *inClusterStrategy:
+		mode = "in-cluster-pod-ip"
+		if s.useServiceDNS {
+			mode = "in-cluster-service"
+		}
+	}
+	c.log.Info("API URL discovered", "url", url, "mode", mode)
+	return nil
+}
+
+// SetGRPCTarget publishes the dial address for sandboxd's ProcessService.
+// Any previously dialed connection is closed so the next GRPCConn call
+// re-dials the new target (e.g. after a tunnel reconnect).
+func (c *connector) SetGRPCTarget(target string) {
+	c.mu.Lock()
+	old := c.grpcConn
+	c.grpcConn = nil
+	c.grpcTarget = target
+	c.mu.Unlock()
+	if old != nil {
+		_ = old.Close()
+	}
+}
+
+// GRPCConn returns a (lazily dialed) client connection to sandboxd's
+// ProcessService. The connection is plaintext, and what protects it depends on
+// the strategy that published the target: podTunnelStrategy traverses an
+// apiserver-authorized port-forward to the pod, while inClusterStrategy sends it
+// across the pod network, where NetworkPolicy (or a mesh) must confine it.
+func (c *connector) GRPCConn() (*grpc.ClientConn, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.grpcConn != nil {
+		return c.grpcConn, nil
+	}
+	prefix := fmt.Sprintf("sandbox[%s/%s]", c.namespace, c.sandboxID)
+	if c.grpcTarget == "" {
+		// A direct URL names only the REST endpoint, so no target will ever
+		// be published. Say so rather than report ErrNotReady forever.
+		if _, direct := c.strategy.(*DirectStrategy); direct {
+			return nil, fmt.Errorf("%s: %w: APIURL reaches only the sandboxd REST API, so Run needs port-forward or in-cluster connectivity", prefix, ErrUnsupportedByRuntime)
+		}
+		if c.lastError != nil {
+			return nil, fmt.Errorf("%s: %w: %w", prefix, ErrNotReady, c.lastError)
+		}
+		return nil, fmt.Errorf("%s: %w: sandboxd gRPC endpoint not connected", prefix, ErrNotReady)
+	}
+	conn, err := grpc.NewClient(c.grpcTarget, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		return nil, fmt.Errorf("%s: failed to create gRPC client: %w", prefix, err)
+	}
+	c.grpcConn = conn
+	return conn, nil
+}
+
+// Close clears state (so concurrent SendRequests see ErrNotReady
+// immediately) then tears down the strategy.
+func (c *connector) Close() error {
+	c.mu.Lock()
+	c.baseURL = ""
+	c.lastError = nil
+	c.sandboxID = ""
+	c.podIP = ""
+	grpcConn := c.grpcConn
+	c.grpcConn = nil
+	c.grpcTarget = ""
+	c.mu.Unlock()
+	if grpcConn != nil {
+		_ = grpcConn.Close()
+	}
+	err := c.strategy.Close()
+	if c.ownsTransport {
+		c.httpClient.CloseIdleConnections()
+	}
+	return err
+}
+
+// IsConnected returns true if a base URL is set.
+func (c *connector) IsConnected() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.baseURL != ""
+}
+
+// BaseURL returns the current base URL.
+func (c *connector) BaseURL() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.baseURL
+}
+
+// SetLastError is called by tunnelStrategy's monitor to signal tunnel death.
+func (c *connector) SetLastError(err error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.lastError = err
+	c.baseURL = ""
+}
+
+// cancelOnClose wraps an io.ReadCloser to run a cleanup function when the
+// caller closes the response body.
+type cancelOnClose struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+func (cc *cancelOnClose) Close() error {
+	err := cc.ReadCloser.Close()
+	cc.cancel()
+	return err
+}
+
+// SendRequest sends an HTTP request to the sandbox router with required
+// headers and retry logic for transient failures.
+//
+// Note on Redirect Handling:
+// Automatic HTTP redirection is disabled in the underlying HTTP client to mitigate
+// client-side SSRF vulnerabilities. If the sandbox returns a redirect status code
+// (e.g., 301, 302, 303, 307, 308), the response is returned directly to the caller
+// with its body unclosed and a nil error (instead of being followed automatically).
+func (c *connector) SendRequest(ctx context.Context, method, endpoint string, body io.Reader, contentType string, maxRetries int) (*http.Response, error) {
+	limit := maxRetries
+	if limit <= 0 {
+		limit = maxAttempts
+	}
+
+	var requestCancel context.CancelFunc
+	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+		ctx, requestCancel = context.WithTimeout(ctx, c.requestTimeout)
+	}
+	defer func() {
+		if requestCancel != nil {
+			requestCancel()
+		}
+	}()
+
+	reqID := generateRequestID()
+	trace.SpanFromContext(ctx).SetAttributes(AttrRequestID.String(reqID))
+
+	var lastErr error
+	var lastURL string
+	for attempt := range limit {
+		c.mu.Lock()
+		if c.baseURL == "" {
+			pfErr := c.lastError
+			sandboxID := c.sandboxID
+			namespace := c.namespace
+			c.mu.Unlock()
+			if pfErr != nil {
+				return nil, fmt.Errorf("sandbox[%s/%s]: %w (reqID=%s): %w", namespace, sandboxID, ErrNotReady, reqID, pfErr)
+			}
+			return nil, fmt.Errorf("sandbox[%s/%s]: %w (reqID=%s)", namespace, sandboxID, ErrNotReady, reqID)
+		}
+		reqURL := strings.TrimRight(c.baseURL, "/") + "/" + strings.TrimLeft(endpoint, "/")
+		lastURL = reqURL
+		sandboxID := c.sandboxID
+		namespace := c.namespace
+		port := c.serverPort
+		podIP := c.podIP
+		c.mu.Unlock()
+
+		var bodyReader io.Reader
+		if body != nil {
+			if seeker, ok := body.(io.Seeker); ok {
+				if _, err := seeker.Seek(0, io.SeekStart); err != nil {
+					return nil, fmt.Errorf("sandbox: failed to reset request body: %w", err)
+				}
+				bodyReader = body
+			} else if attempt == 0 {
+				bodyReader = body
+			} else {
+				return nil, fmt.Errorf("sandbox: cannot retry after %w with non-seekable body", lastErr)
+			}
+		}
+
+		attemptCtx, attemptCancel := context.WithCancel(ctx)
+		attemptTimer := time.AfterFunc(c.perAttemptTimeout, attemptCancel)
+
+		req, err := http.NewRequestWithContext(attemptCtx, method, reqURL, bodyReader)
+		if err != nil {
+			attemptTimer.Stop()
+			attemptCancel()
+			return nil, fmt.Errorf("sandbox: failed to create request: %w", err)
+		}
+
+		// Router headers only apply to router-based transports; the
+		// sandboxd pod tunnel talks to the pod directly.
+		if c.routerHeaders {
+			req.Header.Set(headerSandboxID, sandboxID)
+			req.Header.Set(headerSandboxNamespace, namespace)
+			req.Header.Set(headerSandboxPort, strconv.Itoa(port))
+			if deadline, ok := ctx.Deadline(); ok {
+				remaining := time.Until(deadline)
+				if remaining > 0 {
+					timeout := remaining
+					if c.perAttemptTimeout > 0 && c.perAttemptTimeout < timeout {
+						timeout = c.perAttemptTimeout
+					}
+					req.Header.Set(headerSandboxTimeout, strconv.FormatFloat(timeout.Seconds(), 'f', -1, 64))
+				}
+			}
+			if podIP != "" && !c.disablePodIPRouting {
+				req.Header.Set(headerSandboxPodIP, podIP)
+			}
+		}
+		req.Header.Set(headerRequestID, reqID)
+		if contentType != "" {
+			req.Header.Set("Content-Type", contentType)
+		}
+		propagation.TraceContext{}.Inject(attemptCtx, propagation.HeaderCarrier(req.Header))
+
+		resp, doErr := c.httpClient.Do(req)
+		if doErr != nil {
+			attemptTimer.Stop()
+			attemptCancel()
+			lastErr = doErr
+			if ctx.Err() != nil {
+				return nil, fmt.Errorf("sandbox[%s/%s]: request cancelled (url=%s reqID=%s): %w", namespace, sandboxID, reqURL, reqID, ctx.Err())
+			}
+			if attempt < limit-1 {
+				c.log.V(1).Info("request failed, retrying", "attempt", attempt+1, "maxAttempts", limit, "method", method, "url", reqURL, "reqID", reqID, "error", doErr)
+				sleepWithContext(ctx, c.backoff(attempt))
+				if ctx.Err() != nil {
+					return nil, fmt.Errorf("sandbox[%s/%s]: request cancelled (url=%s reqID=%s): %w", namespace, sandboxID, reqURL, reqID, ctx.Err())
+				}
+			}
+			continue
+		}
+
+		if retryableStatusCodes[resp.StatusCode] {
+			if attempt >= limit-1 {
+				errBody, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodySize))
+				_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxDrainBytes))
+				_ = resp.Body.Close()
+				attemptTimer.Stop()
+				attemptCancel()
+				httpErr := &HTTPError{StatusCode: resp.StatusCode, Body: string(errBody), Operation: method + " " + endpoint}
+				c.log.Error(httpErr, "retries exhausted", "method", method, "url", reqURL, "attempts", limit, "lastStatus", resp.StatusCode, "reqID", reqID, "sandbox", sandboxID, "namespace", namespace)
+				return nil, fmt.Errorf("%w: %s failed after %d attempts (url=%s reqID=%s): %w",
+					ErrRetriesExhausted, method, limit, reqURL, reqID, httpErr)
+			}
+			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxDrainBytes))
+			_ = resp.Body.Close()
+			attemptTimer.Stop()
+			attemptCancel()
+			lastErr = fmt.Errorf("sandbox: server returned %d", resp.StatusCode)
+			c.log.V(1).Info("retryable status, retrying", "attempt", attempt+1, "maxAttempts", limit, "method", method, "url", reqURL, "status", resp.StatusCode, "reqID", reqID)
+			sleepWithContext(ctx, c.backoff(attempt))
+			if ctx.Err() != nil {
+				return nil, fmt.Errorf("sandbox[%s/%s]: request cancelled (url=%s reqID=%s): %w", namespace, sandboxID, reqURL, reqID, ctx.Err())
+			}
+			continue
+		}
+
+		attemptTimer.Stop()
+		// Guard against the rare race where the per-attempt timer fires
+		// between Do() returning and Stop(). The response body is tied to
+		// the cancelled attemptCtx and is unusable; discard and retry.
+		if attemptCtx.Err() != nil {
+			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxDrainBytes))
+			_ = resp.Body.Close()
+			attemptCancel()
+			if ctx.Err() != nil {
+				return nil, fmt.Errorf("sandbox[%s/%s]: request cancelled (url=%s reqID=%s): %w", namespace, sandboxID, reqURL, reqID, ctx.Err())
+			}
+			lastErr = fmt.Errorf("sandbox: per-attempt timeout raced with response receipt")
+			if attempt < limit-1 {
+				c.log.V(1).Info("per-attempt timeout race, retrying", "attempt", attempt+1, "maxAttempts", limit, "method", method, "url", reqURL, "reqID", reqID)
+				sleepWithContext(ctx, c.backoff(attempt))
+				if ctx.Err() != nil {
+					return nil, fmt.Errorf("sandbox[%s/%s]: request cancelled (url=%s reqID=%s): %w", namespace, sandboxID, reqURL, reqID, ctx.Err())
+				}
+			}
+			continue
+		}
+		rc := requestCancel
+		requestCancel = nil
+		resp.Body = &cancelOnClose{ReadCloser: resp.Body, cancel: func() {
+			attemptCancel()
+			if rc != nil {
+				rc()
+			}
+		}}
+		return resp, nil
+	}
+
+	c.mu.Lock()
+	finalSandbox := c.sandboxID
+	finalNS := c.namespace
+	c.mu.Unlock()
+	c.log.Error(lastErr, "retries exhausted", "method", method, "url", lastURL, "attempts", limit, "reqID", reqID, "sandbox", finalSandbox, "namespace", finalNS)
+	return nil, fmt.Errorf("%w: %s failed after %d attempts (url=%s reqID=%s): %w", ErrRetriesExhausted, method, limit, lastURL, reqID, lastErr)
+}
+
+func (c *connector) backoff(attempt int) time.Duration {
+	if attempt == 0 {
+		return 0
+	}
+	d := min(time.Duration(float64(baseBackoff)*math.Pow(2, float64(attempt-1))), maxBackoff)
+	c.mu.Lock()
+	scale := c.backoffScale
+	c.mu.Unlock()
+	if scale > 0 {
+		d = time.Duration(float64(d) * scale)
+	}
+	if d <= 0 {
+		return time.Millisecond
+	}
+	half := int64(d / 2)
+	if half <= 0 {
+		return d
+	}
+	jitter := time.Duration(rand.Int64N(half)) - d/4
+	return d + jitter
+}
+
+// generateRequestID returns a random 16-hex-digit request ID. crypto/rand
+// keeps IDs unpredictable; jitter above stays on math/rand, which is all a
+// backoff delay needs.
+func generateRequestID() string {
+	var b [8]byte
+	_, _ = cryptorand.Read(b[:]) // never returns an error since Go 1.24
+	return hex.EncodeToString(b[:])
+}
+
+func sleepWithContext(ctx context.Context, d time.Duration) {
+	if d <= 0 {
+		return
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+	case <-timer.C:
+	}
+}
