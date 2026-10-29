@@ -245,7 +245,7 @@ func TestScopedTokenV2_RejectsSignedTokenWithoutSandboxUID(t *testing.T) {
 
 func TestScopedTokenV2_BoundsLegacyV1Drain(t *testing.T) {
 	publicKey, _ := newScopedTokenV2Key(t)
-	secret := []byte("0123456789abcdef0123456789abcdef")
+	secret := testSecret()
 	legacyToken, err := MintScopedToken(secret, "team-a", "box-a", time.Minute)
 	if err != nil {
 		t.Fatalf("mint v1: %v", err)
@@ -275,7 +275,7 @@ func TestScopedTokenV2_BoundsLegacyV1Drain(t *testing.T) {
 func TestNewScopedTokenAuthorizer_RejectsUnboundedV1AndV2Overlap(t *testing.T) {
 	publicKey, _ := newScopedTokenV2Key(t)
 	_, err := NewScopedTokenAuthorizer(ScopedTokenOptions{
-		Secret:           []byte("0123456789abcdef0123456789abcdef"),
+		Secret:           testSecret(),
 		VerificationKeys: map[string]ed25519.PublicKey{"current": publicKey},
 	})
 	if err == nil || !strings.Contains(err.Error(), "V1AcceptUntil") {

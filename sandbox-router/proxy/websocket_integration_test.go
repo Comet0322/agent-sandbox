@@ -495,7 +495,7 @@ func TestIntegration_WebSocketAuthenticatedByCookie(t *testing.T) {
 		t.Fatalf("parse backend: %v", err)
 	}
 
-	secret := []byte("0123456789abcdef0123456789abcdef")
+	secret := testSecret()
 	tok, err := authz.MintScopedToken(secret, "test", "ws-sandbox", time.Minute)
 	if err != nil {
 		t.Fatalf("mint: %v", err)
@@ -589,7 +589,7 @@ func TestIntegration_WebSocketRejectedForDisallowedOrigin(t *testing.T) {
 		t.Fatalf("parse backend: %v", err)
 	}
 
-	secret := []byte("0123456789abcdef0123456789abcdef")
+	secret := testSecret()
 	tok, err := authz.MintScopedToken(secret, "test", "ws-sandbox", time.Minute)
 	if err != nil {
 		t.Fatalf("mint: %v", err)

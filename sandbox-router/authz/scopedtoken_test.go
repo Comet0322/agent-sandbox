@@ -28,7 +28,7 @@ import (
 )
 
 func TestScopedToken_ValidTokenAllowsItsOwnSandbox(t *testing.T) {
-	secret := []byte("0123456789abcdef0123456789abcdef")
+	secret := testSecret()
 	tok, err := MintScopedToken(secret, "ns", "box-a", time.Minute)
 	if err != nil {
 		t.Fatalf("mint: %v", err)
@@ -43,7 +43,7 @@ func TestScopedToken_ValidTokenAllowsItsOwnSandbox(t *testing.T) {
 }
 
 func TestScopedToken_RejectsOtherSandbox(t *testing.T) {
-	secret := []byte("0123456789abcdef0123456789abcdef")
+	secret := testSecret()
 	tok, err := MintScopedToken(secret, "ns", "box-a", time.Minute)
 	if err != nil {
 		t.Fatalf("mint: %v", err)
@@ -56,7 +56,7 @@ func TestScopedToken_RejectsOtherSandbox(t *testing.T) {
 }
 
 func TestScopedToken_RejectsOtherNamespace(t *testing.T) {
-	secret := []byte("0123456789abcdef0123456789abcdef")
+	secret := testSecret()
 	tok, err := MintScopedToken(secret, "ns-a", "box", time.Minute)
 	if err != nil {
 		t.Fatalf("mint: %v", err)
@@ -81,7 +81,7 @@ func TestScopedToken_RejectsWrongSecret(t *testing.T) {
 }
 
 func TestScopedToken_RejectsExpiredToken(t *testing.T) {
-	secret := []byte("0123456789abcdef0123456789abcdef")
+	secret := testSecret()
 	tok, err := MintScopedToken(secret, "ns", "box", time.Second)
 	if err != nil {
 		t.Fatalf("mint: %v", err)
@@ -97,7 +97,7 @@ func TestScopedToken_RejectsExpiredToken(t *testing.T) {
 }
 
 func TestScopedToken_RejectsMalformedToken(t *testing.T) {
-	auth, _ := NewScopedTokenAuthorizer(ScopedTokenOptions{Secret: []byte("0123456789abcdef0123456789abcdef")})
+	auth, _ := NewScopedTokenAuthorizer(ScopedTokenOptions{Secret: testSecret()})
 	err := auth.Authorize(context.Background(), reqWithBearer("not-a-real-token"), testAuthorizationTarget("ns", "box"))
 	if !errors.Is(err, ErrUnauthenticated) {
 		t.Fatalf("expected ErrUnauthenticated, got %v", err)
@@ -105,7 +105,7 @@ func TestScopedToken_RejectsMalformedToken(t *testing.T) {
 }
 
 func TestScopedToken_MissingBearerRejected(t *testing.T) {
-	auth, _ := NewScopedTokenAuthorizer(ScopedTokenOptions{Secret: []byte("0123456789abcdef0123456789abcdef")})
+	auth, _ := NewScopedTokenAuthorizer(ScopedTokenOptions{Secret: testSecret()})
 	err := auth.Authorize(context.Background(), reqWithBearer(""), testAuthorizationTarget("ns", "box"))
 	if !errors.Is(err, ErrUnauthenticated) {
 		t.Fatalf("expected ErrUnauthenticated, got %v", err)
@@ -117,7 +117,7 @@ func TestScopedToken_MissingBearerRejected(t *testing.T) {
 // one would let a token scoped to box-a reach a different pod even
 // though X-Sandbox-Id still says box-a and the claim check passes.
 func TestScopedToken_RejectsRoutingOverrides(t *testing.T) {
-	secret := []byte("0123456789abcdef0123456789abcdef")
+	secret := testSecret()
 	tok, err := MintScopedToken(secret, "ns", "box-a", time.Minute)
 	if err != nil {
 		t.Fatalf("mint: %v", err)
@@ -162,7 +162,7 @@ func decodeScopedClaims(t *testing.T, token string) scopedClaims {
 // exp is exclusive: the token is already invalid at the exp second, not
 // only after it.
 func TestScopedToken_RejectsTokenAtExactExpiry(t *testing.T) {
-	secret := []byte("0123456789abcdef0123456789abcdef")
+	secret := testSecret()
 	tok, err := MintScopedToken(secret, "ns", "box", time.Minute)
 	if err != nil {
 		t.Fatalf("mint: %v", err)
@@ -182,7 +182,7 @@ func TestScopedToken_RejectsTokenAtExactExpiry(t *testing.T) {
 // one-second resolution, so a token minted for one second has to be
 // valid at mint time rather than truncating into the past.
 func TestScopedToken_ShortestTTLIsNotBornExpired(t *testing.T) {
-	secret := []byte("0123456789abcdef0123456789abcdef")
+	secret := testSecret()
 	tok, err := MintScopedToken(secret, "ns", "box", time.Second)
 	if err != nil {
 		t.Fatalf("mint: %v", err)
@@ -203,7 +203,7 @@ func TestScopedToken_ShortestTTLIsNotBornExpired(t *testing.T) {
 // from a mounted Secret with a trailing newline interoperates with one
 // read without it.
 func TestScopedToken_SecretWhitespaceNormalized(t *testing.T) {
-	secret := []byte("0123456789abcdef0123456789abcdef")
+	secret := testSecret()
 	tok, err := MintScopedToken(append(append([]byte(nil), secret...), '\n'), "ns", "box", time.Minute)
 	if err != nil {
 		t.Fatalf("mint: %v", err)
@@ -217,7 +217,7 @@ func TestScopedToken_SecretWhitespaceNormalized(t *testing.T) {
 // The authorizer must own its key: mutating the caller's slice after
 // construction must not change what verifies.
 func TestScopedToken_SecretIsCopied(t *testing.T) {
-	secret := []byte("0123456789abcdef0123456789abcdef")
+	secret := testSecret()
 	tok, err := MintScopedToken(secret, "ns", "box", time.Minute)
 	if err != nil {
 		t.Fatalf("mint: %v", err)
@@ -236,7 +236,7 @@ func TestScopedToken_SecretIsCopied(t *testing.T) {
 // (version.payload.signature) so a future format can coexist with
 // outstanding v1 tokens. Pin it so the format isn't changed silently.
 func TestScopedToken_TokenCarriesVersionPrefix(t *testing.T) {
-	secret := []byte("0123456789abcdef0123456789abcdef")
+	secret := testSecret()
 	tok, err := MintScopedToken(secret, "ns", "box", time.Minute)
 	if err != nil {
 		t.Fatalf("mint: %v", err)
@@ -253,7 +253,7 @@ func TestScopedToken_TokenCarriesVersionPrefix(t *testing.T) {
 // be rejected rather than silently accepted, so the discriminator
 // actually gates verification.
 func TestScopedToken_RejectsUnversionedToken(t *testing.T) {
-	secret := []byte("0123456789abcdef0123456789abcdef")
+	secret := testSecret()
 	tok, err := MintScopedToken(secret, "ns", "box", time.Minute)
 	if err != nil {
 		t.Fatalf("mint: %v", err)
@@ -271,7 +271,7 @@ func TestScopedToken_RejectsUnversionedToken(t *testing.T) {
 // secret — what another protocol reusing the key would produce — is not
 // a valid signature here.
 func TestScopedToken_MACIsDomainSeparated(t *testing.T) {
-	secret := []byte("0123456789abcdef0123456789abcdef")
+	secret := testSecret()
 	key, err := normalizeScopedSecret(secret)
 	if err != nil {
 		t.Fatalf("normalize: %v", err)
@@ -309,7 +309,7 @@ func TestNewScopedTokenAuthorizer_RequiresSecret(t *testing.T) {
 // --path-routing-prefix, where the caller is a browser that cannot set
 // a header at all.
 func TestScopedToken_AuthorizesFromQueryAndCookie(t *testing.T) {
-	secret := []byte("0123456789abcdef0123456789abcdef")
+	secret := testSecret()
 	tok, err := MintScopedToken(secret, "ns", "box-a", time.Minute)
 	if err != nil {
 		t.Fatalf("mint: %v", err)
@@ -351,7 +351,7 @@ func TestScopedToken_AuthorizesFromQueryAndCookie(t *testing.T) {
 // string or a cookie must be ignored exactly as before this field
 // existed — a deployment that hasn't opted in is unaffected.
 func TestScopedToken_IgnoresQueryAndCookieByDefault(t *testing.T) {
-	secret := []byte("0123456789abcdef0123456789abcdef")
+	secret := testSecret()
 	tok, err := MintScopedToken(secret, "ns", "box-a", time.Minute)
 	if err != nil {
 		t.Fatalf("mint: %v", err)
@@ -376,12 +376,12 @@ func TestMintScopedToken_RequiresFields(t *testing.T) {
 	}{
 		{"empty secret", nil, "ns", "box", time.Minute},
 		{"short secret", []byte("s"), "ns", "box", time.Minute},
-		{"empty namespace", []byte("0123456789abcdef0123456789abcdef"), "", "box", time.Minute},
-		{"empty name", []byte("0123456789abcdef0123456789abcdef"), "ns", "", time.Minute},
-		{"non-positive ttl", []byte("0123456789abcdef0123456789abcdef"), "ns", "box", 0},
+		{"empty namespace", testSecret(), "", "box", time.Minute},
+		{"empty name", testSecret(), "ns", "", time.Minute},
+		{"non-positive ttl", testSecret(), "ns", "box", 0},
 		// exp has one-second resolution: a sub-second ttl would
 		// truncate to a token that is already expired at mint time.
-		{"sub-second ttl", []byte("0123456789abcdef0123456789abcdef"), "ns", "box", time.Millisecond},
+		{"sub-second ttl", testSecret(), "ns", "box", time.Millisecond},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

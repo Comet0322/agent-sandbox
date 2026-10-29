@@ -50,7 +50,7 @@ const (
 // nothing for this helper to do with it.
 func bootstrapServer(t *testing.T) (*httptest.Server, []byte, string) {
 	t.Helper()
-	secret := []byte("0123456789abcdef0123456789abcdef")
+	secret := testSecret()
 	tok, err := authz.MintScopedToken(secret, bootstrapNamespace, bootstrapID, time.Minute)
 	if err != nil {
 		t.Fatalf("mint: %v", err)
@@ -265,7 +265,7 @@ func TestCookieStripping_MultipleCookieHeaderLines(t *testing.T) {
 		t.Fatalf("parse backend: %v", err)
 	}
 
-	secret := []byte("0123456789abcdef0123456789abcdef")
+	secret := testSecret()
 	tok, err := authz.MintScopedToken(secret, "team", "box-a", time.Minute)
 	if err != nil {
 		t.Fatalf("mint: %v", err)
@@ -387,7 +387,7 @@ func TestBootstrapCookie_TokenScopedToOtherSandboxSetsNoCookie(t *testing.T) {
 }
 
 func TestBootstrapCookie_DifferentSandboxesGetDifferentCookiePaths(t *testing.T) {
-	secret := []byte("0123456789abcdef0123456789abcdef")
+	secret := testSecret()
 	a, _ := authz.NewScopedTokenAuthorizer(authz.ScopedTokenOptions{
 		Secret:         secret,
 		TokenLocations: authz.TokenLocations{QueryParam: "token", CookieName: "sid"},

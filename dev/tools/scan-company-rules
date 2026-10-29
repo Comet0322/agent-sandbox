@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# Reproduces only the findings the company scanner reported:
+#   R1  hardcoded password in Go tests: `secret := []byte("<literal>")`
+#       (token_test.go, scopedtoken_test.go, scopedtoken_v2_test.go,
+#       browsersession_test.go, websocket_integration_test.go).
+#   R2  OS command injection in Python: a subprocess call (run/Popen/call/...)
+#       whose `shell=` argument is anything other than False. Reported at the
+#       line the call starts on (examples/firecracker-sandbox/main.py:224, and
+#       the removed lifecycle/source/server.py:32).
+# Scans tracked files only. Exits 1 when anything is found.
+set -uo pipefail
+cd "$(git rev-parse --show-toplevel)"
+found=0
+
+echo "== R1: secret := []byte(\"...\") in Go tests"
+r1=$(git ls-files '*_test.go' | xargs grep -nE '^[[:space:]]*secret[[:space:]]*:=[[:space:]]*\[\]byte\("' 2>/dev/null)
+[ -n "$r1" ] && { echo "$r1"; found=1; }
+echo "R1 hits: $(printf '%s' "$r1" | grep -c .)"
+
+echo; echo "== R2: subprocess call with shell= other than False"
+r2=$(git ls-files '*.py' | while read -r f; do
+  awk -v f="$f" '
+    /^[[:space:]]*#/ { next }
+    /subprocess\.(run|Popen|call|check_call|check_output)\(/ { start=NR; text=$0; open=1; budget=20 }
+    open { if (NR>start) text=text "\n" $0; budget--
+           if (text ~ /shell[[:space:]]*=[[:space:]]*([^F[:space:],)]|F[^a])/ ) { print f ":" start ": " first(start) ; open=0 }
+           else if (budget<=0) open=0 }
+    function first(n) { return "subprocess call with shell=" }
+  ' "$f"
+done)
+[ -n "$r2" ] && { echo "$r2"; found=1; }
+echo "R2 hits: $(printf '%s' "$r2" | grep -c .)"
+exit $found
